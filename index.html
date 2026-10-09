@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-v="3">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -137,6 +137,22 @@ input[type=range] { width: 100%; accent-color: var(--known); }
 #toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(env(safe-area-inset-bottom, 0px) + 100px);
   background: var(--text); color: var(--ink); padding: 10px 16px; border-radius: 12px; text-align: center; font-weight: 600; z-index: 20;
   max-width: calc(100% - 32px); }
+.photo-wrap { border-radius: 12px; overflow: hidden; background: var(--panel-2); border: 1px solid var(--line); }
+#photo-canvas { display: block; width: 100%; height: auto; }
+.results { display: grid; gap: 6px; }
+.res { display: grid; grid-template-columns: 26px 52px minmax(0, 1fr) auto; gap: 10px; align-items: center; text-align: left;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px; min-width: 0; }
+.res .num { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font: 700 12px/1 var(--mono);
+  background: var(--unknown); color: var(--ink); }
+.res.known .num { background: var(--known); color: var(--known-ink); }
+.res img { width: 52px; height: 52px; border-radius: 9px; object-fit: cover; }
+.res .t { min-width: 0; display: grid; gap: 1px; }
+.res .n { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.res .h, .res .alt { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.res .alt b { color: var(--text); font-weight: 600; }
+.res .sc { font: 12px/1 var(--mono); color: var(--known); font-variant-numeric: tabular-nums; }
+.res:not(.known) .sc { color: var(--muted); }
+.back { justify-self: start; }
 @media (prefers-reduced-motion: reduce) { .sheet, .sheet[hidden], .progress > div { transition: none; } }
 </style>
 </head>
@@ -150,6 +166,9 @@ input[type=range] { width: 100%; accent-color: var(--known); }
   <span class="mark">RT<i>PI</i></span>
   <span class="chip" id="status">Starting…</span>
   <span class="spacer"></span>
+  <button class="icon-btn" id="btn-photo" aria-label="Check a photo">
+    <svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="15" height="13" rx="2"/><circle cx="10" cy="9.2" r="2.3"/><path d="M5.8 17c.7-2 2.3-3.2 4.2-3.2s3.5 1.2 4.2 3.2"/><circle cx="18" cy="17" r="2.8"/><path d="m20 19 2 2"/></svg>
+  </button>
   <button class="icon-btn" id="btn-settings" aria-label="Settings">
     <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
   </button>
@@ -170,7 +189,7 @@ input[type=range] { width: 100%; accent-color: var(--known); }
 
 <div id="notice">
   <h2 id="notice-title">Loading face models</h2>
-  <p id="notice-text">About 16 MB, downloaded once and then kept on this phone.</p>
+  <p id="notice-text">About 27 MB, downloaded once and then kept on this phone.</p>
   <div class="progress" id="notice-progress"><div></div></div>
   <div class="row" id="notice-actions" hidden></div>
 </div>
@@ -223,6 +242,19 @@ input[type=range] { width: 100%; accent-color: var(--known); }
   </form>
 </section>
 
+<!-- Check a photo -->
+<section class="sheet" id="sheet-photo" hidden aria-label="Check a photo">
+  <div class="grab"></div>
+  <h3>Check a photo</h3>
+  <p class="sub" id="photo-sub">Pick a photo from your gallery. Group photos work too.</p>
+  <div class="stack">
+    <div class="photo-wrap" id="photo-wrap" hidden><canvas id="photo-canvas"></canvas></div>
+    <div class="results" id="photo-results"></div>
+    <button class="btn primary" id="btn-pick-photo">Choose photo</button>
+    <input type="file" id="file-check" accept="image/*" hidden>
+  </div>
+</section>
+
 <!-- Settings -->
 <section class="sheet" id="sheet-settings" hidden aria-label="Settings">
   <div class="grab"></div>
@@ -253,13 +285,13 @@ input[type=range] { width: 100%; accent-color: var(--known); }
       </select>
     </label>
     <label class="toggle"><span>Show match scores on screen</span><input type="checkbox" id="s-scores"></label>
-    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded.</p>
+    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded. · v3</p>
   </div>
 </section>
 
 <div id="toast" hidden></div>
 
 <script src="vendor/ort.wasm.min.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>
