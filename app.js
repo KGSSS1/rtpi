@@ -3,6 +3,36 @@
    -> MobileFaceNet (w600k_mbf) 512-d embedding -> cosine match against the local people list. */
 'use strict';
 
+const APP_V = '3';
+// Never sit silently on the loading screen: show any startup error.
+let started = false; // once the camera loop runs, errors are logged instead of taking over the screen
+function fatal(msg) {
+  const n = document.getElementById('notice'); if (!n || started || /version mismatch/.test(msg)) return;
+  n.hidden = false;
+  document.getElementById('notice-title').textContent = "RTPI couldn't start";
+  document.getElementById('notice-text').textContent = msg;
+  const p = document.getElementById('notice-progress'); if (p) p.hidden = true;
+  const a = document.getElementById('notice-actions');
+  if (a) { a.hidden = false; a.innerHTML = '<button class="btn primary" onclick="location.reload()">Reload</button>'; }
+}
+addEventListener('error', (e) => fatal(`${e.message || 'Script error'}${e.filename ? ` (${e.filename.split('/').pop()}:${e.lineno})` : ''}`));
+addEventListener('unhandledrejection', (e) => fatal(String(e.reason && e.reason.message || e.reason)));
+
+// index.html and app.js must come from the same upload. If the browser mixed an old saved copy
+// with a new file, clear the saved app files once and reload.
+if (document.documentElement.dataset.v !== APP_V) {
+  let tried = false; try { tried = sessionStorage.getItem('rtpi-fix') === APP_V; sessionStorage.setItem('rtpi-fix', APP_V); } catch { }
+  if (!tried) {
+    Promise.resolve()
+      .then(() => navigator.serviceWorker && navigator.serviceWorker.getRegistrations().then((rs) => Promise.all(rs.map((r) => r.unregister()))))
+      .then(() => self.caches && caches.keys().then((ks) => Promise.all(ks.filter((k) => !k.startsWith('rtpi-assets') && k !== 'rtpi-share').map((k) => caches.delete(k)))))
+      .catch(() => {}).finally(() => location.reload());
+  } else {
+    fatal(`The app files on your site are from different versions (index.html is v${document.documentElement.dataset.v || '1'}, app.js is v${APP_V}). Upload all four files (index.html, app.js, sw.js, manifest.webmanifest) to GitHub again, wait two minutes, then reload.`);
+  }
+  throw new Error('version mismatch');
+}
+
 const $ = (s) => document.querySelector(s);
 const ARC = [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]];
 const DIM = 512;
@@ -70,24 +100,56 @@ async function reloadPeople() {
 }
 
 /* ---------- models ---------- */
+const ASSETS = [
+  { key: 'wasm', url: 'vendor/ort-wasm-simd-threaded.wasm', size: 11246032 },
+  { key: 'det', url: 'models/det_500m.onnx', size: 2524817 },
+  { key: 'rec', url: 'models/w600k_mbf.onnx', size: 13616099 },
+];
+const ASSET_CACHE = 'rtpi-assets-1';
+
 async function fetchWithProgress(url, onBytes) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-  const total = +res.headers.get('content-length') || 0;
-  if (!res.body || !total) { const b = await res.arrayBuffer(); onBytes(b.byteLength); return b; }
-  const reader = res.body.getReader(); const chunks = []; let got = 0;
-  for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; onBytes(value.length); }
-  const out = new Uint8Array(got); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; } return out.buffer;
+  const ctl = new AbortController(); let timer;
+  const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 30000); };
+  arm();
+  try {
+    const res = await fetch(url, { signal: ctl.signal, cache: 'no-cache' });
+    if (!res.ok) throw new Error(res.status === 404 ? `${url} is missing on your site. Upload the ${url.split('/')[0]} folder to GitHub.` : `${url}: HTTP ${res.status}`);
+    const reader = res.body.getReader(); const chunks = []; let got = 0;
+    for (;;) { const { done, value } = await reader.read(); if (done) break; arm(); chunks.push(value); got += value.length; onBytes(value.length); }
+    const out = new Uint8Array(got); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; } return out.buffer;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('The download stalled. Check your internet connection and reload.');
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+
+async function getAsset(a, onBytes) {
+  let cache = null;
+  try {
+    cache = await caches.open(ASSET_CACHE);
+    const hit = await cache.match(a.url);
+    if (hit) { const b = await hit.arrayBuffer(); if (b.byteLength === a.size) { onBytes(b.byteLength); return b; } }
+  } catch { cache = null; }
+  const buf = await fetchWithProgress(a.url, onBytes);
+  if (buf.byteLength !== a.size) throw new Error(`${a.url} on your site is ${(buf.byteLength / 1e6).toFixed(2)} MB but should be ${(a.size / 1e6).toFixed(2)} MB. Upload that file to GitHub again.`);
+  try { await cache?.put(a.url, new Response(buf.slice(0), { headers: { 'content-type': 'application/octet-stream' } })); } catch { /* storage full or blocked: works, just re-downloads next time */ }
+  return buf;
 }
 
 async function loadModels() {
   ort.env.wasm.wasmPaths = new URL('vendor/', location.href).href;
   ort.env.logLevel = 'error';
   ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
-  const sizes = { det: 2524817, rec: 13616099 }; const total = sizes.det + sizes.rec; let got = 0;
-  const bar = $('#notice-progress > div');
-  const tick = (n) => { got += n; bar.style.width = Math.min(100, (got / total) * 100).toFixed(1) + '%'; };
-  const [detBuf, recBuf] = await Promise.all([fetchWithProgress('models/det_500m.onnx', tick), fetchWithProgress('models/w600k_mbf.onnx', tick)]);
+  const total = ASSETS.reduce((t, a) => t + a.size, 0); let got = 0;
+  const bar = $('#notice-progress > div'), txt = $('#notice-text');
+  const tick = (n) => {
+    if (app.loadError) return;
+    got += n; bar.style.width = Math.min(100, (got / total) * 100).toFixed(1) + '%';
+    txt.textContent = `${(got / 1e6).toFixed(1)} of ${(total / 1e6).toFixed(0)} MB. Downloaded once, then kept on this phone.`;
+  };
+  const [wasmBuf, detBuf, recBuf] = await Promise.all(ASSETS.map((a) => getAsset(a, tick)));
+  ort.env.wasm.wasmBinary = wasmBuf;
+  $('#notice-title').textContent = 'Preparing face models'; txt.textContent = 'Almost ready…';
   const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'all', logSeverityLevel: 3 };
   app.det = await ort.InferenceSession.create(detBuf, opts);
   app.rec = await ort.InferenceSession.create(recBuf, opts);
@@ -583,13 +645,13 @@ document.addEventListener('visibilitychange', async () => {
   sizeOverlay(); bindSettings();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname))) navigator.serviceWorker.register('sw.js').catch(() => {});
   try { await DB.open(); } catch (e) { console.warn('IndexedDB unavailable; people will not be kept between visits', e); }
-  showNotice('Loading face models', 'About 16 MB, downloaded once and then kept on this phone.', [], true);
+  showNotice('Loading face models', 'About 27 MB, downloaded once and then kept on this phone.', [], true);
   try { await loadModels(); }
-  catch (e) { console.error(e); showNotice('Models failed to load', 'Check your connection and reload. After the first load the app works offline.', [{ label: 'Reload', primary: true, fn: () => location.reload() }]); return; }
+  catch (e) { console.error(e); app.loadError = true; showNotice("Couldn't load the face models", e.message || String(e), [{ label: 'Reload', primary: true, fn: () => location.reload() }]); return; }
   await reloadPeople();
   window.__rtpi = app;
   if (new URLSearchParams(location.search).has('shared')) { hideNotice(); await takeSharedPhoto(); }
   showNotice('Starting camera', 'Allow camera access when your browser asks.');
-  if (await startCamera()) { updateNotice(); loop(); }
+  if (await startCamera()) { updateNotice(); started = true; loop(); }
   window.__rtpi = app; // for testing
 })();
