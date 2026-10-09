@@ -158,6 +158,15 @@ async function embedMany(src, faces) {
   return faces.map((_, k) => normalize(Float32Array.from(d.subarray(k * DIM, (k + 1) * DIM))));
 }
 
+function matchTop(e, k = 3) {
+  const N = app.people.length, top = [];
+  for (let p = 0; p < N; p++) {
+    let s = 0; const o = p * DIM; for (let i = 0; i < DIM; i++) s += app.E[o + i] * e[i];
+    if (top.length < k || s > top[top.length - 1].s) { top.push({ p: app.people[p], s }); top.sort((a, b) => b.s - a.s); if (top.length > k) top.pop(); }
+  }
+  return top;
+}
+
 function match(e) {
   const N = app.people.length; let best = -1, second = -1, bi = -1;
   for (let p = 0; p < N; p++) {
@@ -198,7 +207,7 @@ async function loop() {
   if (app.running) return; app.running = true;
   let lastT = performance.now();
   while (app.running) {
-    if (!app.stream || video.readyState < 2 || !video.videoWidth || document.hidden) { await sleep(120); continue; }
+    if (app.paused || !app.stream || video.readyState < 2 || !video.videoWidth || document.hidden) { await sleep(120); continue; }
     const vw = video.videoWidth, vh = video.videoHeight, k = Math.min(1, MAX_SIDE / Math.max(vw, vh));
     const W = Math.round(vw * k), H = Math.round(vh * k);
     if (frameCanvas.width !== W || frameCanvas.height !== H) { frameCanvas.width = W; frameCanvas.height = H; }
@@ -227,8 +236,9 @@ function updateTracks(faces, embs) {
     const t = bestT || { id: app.nextTrackId++, emb: null, seen: 0 };
     used.add(t);
     // smooth the identity over frames: running mean of embeddings, re-normalised
-    if (!t.emb) t.emb = Float32Array.from(embs[i]);
-    else { const w = Math.min(t.seen, 6); for (let d = 0; d < DIM; d++) t.emb[d] = t.emb[d] * w + embs[i][d]; normalize(t.emb); }
+    let same = 0; if (t.emb) for (let d = 0; d < DIM; d++) same += t.emb[d] * embs[i][d];
+    if (!t.emb || same < 0.4) { t.emb = Float32Array.from(embs[i]); t.seen = 0; } // new face in this spot: start fresh
+    else { const w = Math.min(t.seen, 4); for (let d = 0; d < DIM; d++) t.emb[d] = t.emb[d] * w + embs[i][d]; normalize(t.emb); }
     t.seen++; t.box = f.box; t.pts = f.pts; t.raw = embs[i]; t.missed = 0;
     t.result = match(t.emb);
     next.push(t);
@@ -327,14 +337,14 @@ function updateNotice() {
 
 /* ---------- sheets ---------- */
 let openSheetEl = null;
-function openSheet(id) { closeSheet(); openSheetEl = $(id); openSheetEl.hidden = false; $('#scrim').hidden = false; }
-function closeSheet() { if (openSheetEl) openSheetEl.hidden = true; openSheetEl = null; $('#scrim').hidden = true; }
+function openSheet(id) { closeSheet(); openSheetEl = $(id); openSheetEl.hidden = false; $('#scrim').hidden = false; app.paused = id === '#sheet-photo'; if (app.paused) { app.tracks = []; draw(); } }
+function closeSheet() { if (openSheetEl) openSheetEl.hidden = true; openSheetEl = null; $('#scrim').hidden = true; if (app.paused) app.tracks = []; app.paused = false; }
 $('#scrim').onclick = closeSheet;
 addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
 
-function openPerson(p, score) {
+function openPerson(p, score, fromPhoto = false) {
   const thr = app.settings.thr;
-  $('#person-body').innerHTML = `
+  $('#person-body').innerHTML = `${fromPhoto ? '<button class="btn back" id="btn-back-photo">← Back to photo</button>' : ''}
     <div class="person">
       <img src="${esc(p.thumb)}" alt="">
       <div class="who">
@@ -346,6 +356,7 @@ function openPerson(p, score) {
     ${score != null ? `<div class="match"><span>match</span><div class="meter"><div style="width:${Math.max(0, Math.min(1, score)) * 100}%"></div><i style="left:${thr * 100}%"></i></div><span>${score.toFixed(2)}</span></div>` : ''}
     ${p.link ? `<a class="link" href="${esc(p.link)}" target="_blank" rel="noopener">${esc(p.link.replace(/^https?:\/\/(www\.)?/, ''))}</a>` : ''}
     <button class="btn danger" id="btn-del-person">Remove from this phone</button>`;
+  if (fromPhoto) $('#btn-back-photo').onclick = () => openSheet('#sheet-photo');
   armButton($('#btn-del-person'), 'Tap again to remove', async () => { await DB.del(p.id); await reloadPeople(); closeSheet(); toast(`Removed ${p.name}`); });
   openSheet('#sheet-person');
 }
@@ -453,6 +464,101 @@ $('#add-form').onsubmit = async (e) => {
   toast(dup?.person ? `Saved ${name}. Looks similar to ${dup.person.name}; check it's not a duplicate.` : `Saved ${name}`, dup?.person ? 4500 : 2200);
 };
 
+/* ---------- check a photo ---------- */
+function cropData(src, box, size = 160) {
+  const [x1, y1, x2, y2] = box, cx = (x1 + x2) / 2, cy = (y1 + y2) / 2, half = Math.max(x2 - x1, y2 - y1) * 0.9;
+  const c = canvas(size, size); const g = c.getContext('2d'); g.fillStyle = '#20262f'; g.fillRect(0, 0, size, size);
+  g.drawImage(src, cx - half, cy - half, half * 2, half * 2, 0, 0, size, size);
+  return c.toDataURL('image/jpeg', 0.82);
+}
+
+async function checkPhoto(blob) {
+  openSheet('#sheet-photo');
+  if (!app.det) { $('#photo-sub').textContent = 'The face models are still loading. Try again in a moment.'; return; }
+  $('#photo-sub').textContent = 'Looking for faces…'; $('#photo-results').innerHTML = ''; $('#photo-wrap').hidden = true;
+  let bmp;
+  try { bmp = await createImageBitmap(blob); } catch { $('#photo-sub').textContent = "That file couldn't be opened as a photo."; return; }
+  const k = Math.min(1, 2000 / Math.max(bmp.width, bmp.height)), W = Math.round(bmp.width * k), H = Math.round(bmp.height * k);
+  const c = canvas(W, H); c.getContext('2d').drawImage(bmp, 0, 0, W, H); bmp.close?.();
+  let faces = [];
+  try {
+    faces = await detect(c, W, H, 640, 0.5);
+    if (!faces.length && Math.max(W, H) > 900) faces = await detect(c, W, H, 960, 0.45); // retry for small faces
+  } catch (e) { console.error(e); }
+  faces = faces.slice(0, 40).sort((a, b) => a.box[0] - b.box[0]);
+  const embs = faces.length ? await embedMany(c, faces) : [];
+  // each person can only appear once: strongest match claims them
+  const res = faces.map((f, i) => ({ f, e: embs[i], top: app.people.length ? matchTop(embs[i], 3) : [], person: null, crop: cropData(c, f.box) }));
+  const taken = new Set();
+  [...res].sort((a, b) => (b.top[0]?.s || 0) - (a.top[0]?.s || 0)).forEach((r) => {
+    const [a, b] = r.top;
+    if (a && a.s >= app.settings.thr && a.s - Math.max(b?.s || 0, 0) >= app.settings.margin && !taken.has(a.p.id)) { r.person = a.p; r.score = a.s; taken.add(a.p.id); }
+  });
+  app.photo = { c, W, H, res };
+  renderPhoto();
+}
+
+function renderPhoto() {
+  const { c, W, H, res } = app.photo;
+  const known = getComputedStyle(document.documentElement).getPropertyValue('--known').trim();
+  const grey = getComputedStyle(document.documentElement).getPropertyValue('--unknown').trim();
+  const named = res.filter((r) => r.person).length;
+  $('#photo-sub').textContent = !res.length ? 'No faces found. Try a clearer photo where faces are larger.'
+    : !app.people.length ? `${res.length} face${res.length > 1 ? 's' : ''} found. Import your face pack to name them.`
+    : `${res.length} face${res.length > 1 ? 's' : ''} found · ${named} recognised`;
+  // annotated image
+  const wrap = $('#photo-wrap'); wrap.hidden = false;
+  const cssW = wrap.clientWidth || 360, dpr = Math.min(devicePixelRatio || 1, 2), sc = (cssW * dpr) / W;
+  const pc = $('#photo-canvas'); pc.width = Math.round(W * sc); pc.height = Math.round(H * sc);
+  const g = pc.getContext('2d'); g.drawImage(c, 0, 0, pc.width, pc.height);
+  const R = Math.max(10, 11 * dpr);
+  res.forEach((r, i) => {
+    const [x1, y1, x2, y2] = r.f.box.map((v) => v * sc), col = r.person ? known : grey;
+    g.lineWidth = Math.max(2, 2 * dpr); g.strokeStyle = col; g.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    const cx = Math.min(pc.width - R, Math.max(R, x1)), cy = Math.max(R, y1);
+    g.fillStyle = col; g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.fill();
+    g.fillStyle = r.person ? '#1d1505' : '#0e1116'; g.font = `700 ${Math.round(R * 1.1)}px ui-monospace, monospace`;
+    g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(String(i + 1), cx, cy + 1);
+  });
+  // result rows
+  const list = $('#photo-results'); list.innerHTML = '';
+  res.forEach((r, i) => {
+    const b = document.createElement('button'); b.className = 'res' + (r.person ? ' known' : '');
+    const small = r.f.box[2] - r.f.box[0] < 40;
+    const others = r.top.filter((t) => t.p !== r.person).slice(0, 2).map((t) => `${esc(t.p.name)} ${t.s.toFixed(2)}`).join(' · ');
+    let n, h, alt = '', sc2 = '';
+    if (r.person) {
+      n = esc(r.person.name); h = esc(r.person.headline || r.person.organisation || ''); sc2 = r.score.toFixed(2);
+      if (others) alt = `Next closest: ${others}`;
+    } else if (!app.people.length) { n = 'Face'; h = 'Import your face pack to name people'; }
+    else {
+      n = 'Unknown'; const t = r.top[0];
+      h = t ? `Closest: <b>${esc(t.p.name)}</b> ${t.s.toFixed(2)}` : '';
+      alt = small ? 'Face is small in this photo, so the result is less reliable' : 'Tap to add this person';
+      sc2 = t ? t.s.toFixed(2) : '';
+    }
+    if (r.person && small) alt = 'Face is small in this photo, so double-check';
+    b.innerHTML = `<span class="num">${i + 1}</span><img src="${r.crop}" alt=""><span class="t"><span class="n">${n}</span>${h ? `<span class="h">${h}</span>` : ''}${alt ? `<span class="alt">${alt}</span>` : ''}</span><span class="sc">${sc2}</span>`;
+    b.onclick = () => r.person ? openPerson(r.person, r.score, true) : openAdd({ thumb: r.crop, emb: Float32Array.from(r.e) });
+    list.append(b);
+  });
+  $('#btn-pick-photo').textContent = res.length ? 'Check another photo' : 'Choose photo';
+}
+
+$('#btn-photo').onclick = () => { if (!app.photo) { $('#photo-sub').textContent = 'Pick a photo from your gallery. Group photos work too.'; } openSheet('#sheet-photo'); };
+$('#btn-pick-photo').onclick = () => $('#file-check').click();
+$('#file-check').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) checkPhoto(f); };
+
+// photos shared to RTPI from other apps (Android share menu, installed app only)
+async function takeSharedPhoto() {
+  if (!new URLSearchParams(location.search).has('shared')) return;
+  history.replaceState(null, '', location.pathname);
+  try {
+    const cache = await caches.open('rtpi-share'); const hit = await cache.match('shared-image');
+    if (hit) { await cache.delete('shared-image'); await checkPhoto(await hit.blob()); }
+  } catch (e) { console.error(e); toast("Couldn't open the shared photo."); }
+}
+
 /* settings */
 function bindSettings() {
   const s = app.settings;
@@ -475,12 +581,14 @@ document.addEventListener('visibilitychange', async () => {
 /* ---------- boot ---------- */
 (async function boot() {
   sizeOverlay(); bindSettings();
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname))) navigator.serviceWorker.register('sw.js').catch(() => {});
   try { await DB.open(); } catch (e) { console.warn('IndexedDB unavailable; people will not be kept between visits', e); }
   showNotice('Loading face models', 'About 16 MB, downloaded once and then kept on this phone.', [], true);
   try { await loadModels(); }
   catch (e) { console.error(e); showNotice('Models failed to load', 'Check your connection and reload. After the first load the app works offline.', [{ label: 'Reload', primary: true, fn: () => location.reload() }]); return; }
   await reloadPeople();
+  window.__rtpi = app;
+  if (new URLSearchParams(location.search).has('shared')) { hideNotice(); await takeSharedPhoto(); }
   showNotice('Starting camera', 'Allow camera access when your browser asks.');
   if (await startCamera()) { updateNotice(); loop(); }
   window.__rtpi = app; // for testing
