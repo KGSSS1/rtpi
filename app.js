@@ -4,7 +4,7 @@
    -> cosine match against the local people list. */
 'use strict';
 
-const APP_V = '5';
+const APP_V = '6';
 // Never sit silently on the loading screen: show any startup error.
 let started = false; // once the camera loop runs, errors are logged instead of taking over the screen
 function fatal(msg) {
@@ -39,7 +39,8 @@ const ARC = [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.549
 const DIM = 512;
 const DEFAULTS = { model: 'accurate', thr_accurate: 0.40, thr_fast: 0.42, margin: 0.05, det: 384, max: 3, scores: false, facing: 'user' };
 const MODELS = {
-  accurate: { key: 'emb_r50', name: 'Accurate', parts: [{ url: 'models/r50_int8.onnx.001', size: 21894290 }, { url: 'models/r50_int8.onnx.002', size: 21894289 }] },
+  // split into ~11 MB parts to stay well under GitHub's web-upload size limit
+  accurate: { key: 'emb_r50', name: 'Accurate', parts: [1, 2, 3, 4].map((i) => ({ url: `models/r50_int8.onnx.00${i}`, size: i < 4 ? 10947145 : 10947144 })) },
   fast: { key: 'emb', name: 'Fast', parts: [{ url: 'models/w600k_mbf.onnx', size: 13616099 }] },
 };
 const thr = () => +app.settings['thr_' + app.settings.model];
@@ -221,7 +222,8 @@ async function loadModels() {
 async function getDet10() {
   if (app.det10) return app.det10;
   if (!app.det10P) app.det10P = (async () => {
-    const buf = await getAsset({ url: 'models/det_10g.onnx', size: 16923827 }, () => {});
+    const bufs = await Promise.all([{ url: 'models/det_10g.onnx.001', size: 8461914 }, { url: 'models/det_10g.onnx.002', size: 8461913 }].map((a) => getAsset(a, () => {})));
+    const buf = joinBuffers(bufs);
     app.det10 = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all', logSeverityLevel: 3 });
     return app.det10;
   })().catch((e) => { app.det10P = null; throw e; });

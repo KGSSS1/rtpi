@@ -1,5 +1,5 @@
 // Offline cache: after the first visit the app, models and runtime load from the phone.
-const CACHE = 'rtpi-v5';
+const CACHE = 'rtpi-v6';
 const FILES = ['./', 'index.html', 'app.js', 'rec-worker.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-180.png',
   'vendor/ort.wasm.min.js', 'vendor/ort-wasm-simd-threaded.mjs'];
 // the large model and runtime files are downloaded and kept by the page itself (cache 'rtpi-assets-…')
