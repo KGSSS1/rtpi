@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-v="3">
+<html lang="en" data-v="5">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -113,6 +113,7 @@ button { cursor: pointer; }
 a.link { color: var(--known); overflow-wrap: anywhere; }
 
 label.field { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }
+label.field small { color: var(--muted); font-size: 12px; }
 input[type=text], input[type=url], input[type=search], select { width: 100%; background: var(--panel-2);
   border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; color: var(--text); }
 input[type=range] { width: 100%; accent-color: var(--known); }
@@ -132,6 +133,17 @@ input[type=range] { width: 100%; accent-color: var(--known); }
 .list .n { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .list .h { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tag { font: 11px var(--mono); color: var(--known); border: 1px solid var(--known); border-radius: 4px; padding: 0 4px; margin-left: 6px; }
+.photos, .existing { display: grid; gap: 10px; border-top: 1px solid var(--line); padding-top: 12px; }
+.photos-head { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--muted); }
+.photos-head .count { font: 12px var(--mono); color: var(--known); }
+.strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
+.strip figure { position: relative; margin: 0; flex: 0 0 64px; }
+.strip img { width: 64px; height: 64px; border-radius: 10px; object-fit: cover; display: block; background: var(--panel-2); }
+.strip figcaption { position: absolute; left: 4px; bottom: 4px; font: 10px/1 var(--mono); background: rgba(14,17,22,.8); color: var(--text); padding: 2px 4px; border-radius: 4px; }
+.strip .rm { position: absolute; top: -6px; right: -6px; width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--line);
+  background: var(--panel); color: var(--text); font-size: 15px; line-height: 1; display: grid; place-items: center; padding: 0; }
+.strip .rm.armed { background: var(--danger); border-color: var(--danger); color: #1a0705; font-weight: 700; }
+.hint { color: var(--muted); font-size: 12px; }
 .privacy { font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 12px; }
 .preview-face { width: 112px; height: 112px; border-radius: 12px; background: var(--panel-2); object-fit: cover; }
 #toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(env(safe-area-inset-bottom, 0px) + 100px);
@@ -189,7 +201,7 @@ input[type=range] { width: 100%; accent-color: var(--known); }
 
 <div id="notice">
   <h2 id="notice-title">Loading face models</h2>
-  <p id="notice-text">About 27 MB, downloaded once and then kept on this phone.</p>
+  <p id="notice-text">Downloaded once, then kept on this phone.</p>
   <div class="progress" id="notice-progress"><div></div></div>
   <div class="row" id="notice-actions" hidden></div>
 </div>
@@ -200,6 +212,7 @@ input[type=range] { width: 100%; accent-color: var(--known); }
 <section class="sheet" id="sheet-person" hidden aria-label="Person details">
   <div class="grab"></div>
   <div class="stack" id="person-body"></div>
+  <input type="file" id="file-extra" accept="image/*" hidden>
 </section>
 
 <!-- People library -->
@@ -233,6 +246,12 @@ input[type=range] { width: 100%; accent-color: var(--known); }
         <input type="file" id="file-photo" accept="image/*" hidden>
       </div>
     </div>
+    <div class="existing" id="add-existing">
+      <div class="photos-head"><span>Already in your list? Save this face to them</span></div>
+      <input type="search" id="add-existing-q" placeholder="Search by name" aria-label="Search people to add this face to">
+      <div class="list" id="add-existing-list"></div>
+    </div>
+    <div class="photos-head"><span>Or add a new person</span></div>
     <label class="field">Name<input type="text" id="add-name" required></label>
     <label class="field">Headline<input type="text" id="add-headline"></label>
     <label class="field">College / company<input type="text" id="add-org"></label>
@@ -261,6 +280,13 @@ input[type=range] { width: 100%; accent-color: var(--known); }
   <h3>Settings</h3>
   <p class="sub">Tune these during your first live test.</p>
   <div class="stack">
+    <label class="field">Recognition model
+      <select id="s-model">
+        <option value="accurate">Accurate · ResNet-50 (44 MB)</option>
+        <option value="fast">Fast · MobileFaceNet (14 MB)</option>
+      </select>
+      <small id="model-note"></small>
+    </label>
     <div class="setting">
       <div class="lbl"><span>Match threshold</span><span class="val" id="v-thr"></span></div>
       <input type="range" id="s-thr" min="0.25" max="0.65" step="0.01">
@@ -279,19 +305,19 @@ input[type=range] { width: 100%; accent-color: var(--known); }
         <option value="640">640 · slowest</option>
       </select>
     </label>
-    <label class="field">Faces recognised per frame
+    <label class="field">Faces recognised per frame (Fast model)
       <select id="s-max">
         <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="5">5</option>
       </select>
     </label>
     <label class="toggle"><span>Show match scores on screen</span><input type="checkbox" id="s-scores"></label>
-    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded. · v3</p>
+    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded. · v5</p>
   </div>
 </section>
 
 <div id="toast" hidden></div>
 
 <script src="vendor/ort.wasm.min.js"></script>
-<script src="app.js?v=3"></script>
+<script src="app.js?v=5"></script>
 </body>
 </html>

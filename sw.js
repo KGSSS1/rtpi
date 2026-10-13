@@ -1,6 +1,6 @@
 // Offline cache: after the first visit the app, models and runtime load from the phone.
-const CACHE = 'rtpi-v3';
-const FILES = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-180.png',
+const CACHE = 'rtpi-v5';
+const FILES = ['./', 'index.html', 'app.js', 'rec-worker.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-180.png',
   'vendor/ort.wasm.min.js', 'vendor/ort-wasm-simd-threaded.mjs'];
 // the large model and runtime files are downloaded and kept by the page itself (cache 'rtpi-assets-…')
 self.addEventListener('install', (e) => {
@@ -23,8 +23,8 @@ self.addEventListener('fetch', (e) => {
     return;
   }
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
-  if (/\.(onnx|wasm)$/.test(url.pathname)) return; // handled by the page
-  if (url.pathname.endsWith('/') || url.pathname.endsWith('/index.html') || url.pathname.endsWith('app.js')) {
+  if (/\.(onnx|wasm)(\.\d+)?$/.test(url.pathname)) return; // handled by the page
+  if (url.pathname.endsWith('/') || url.pathname.endsWith('/index.html') || url.pathname.endsWith('app.js') || url.pathname.endsWith('rec-worker.js')) {
     // app shell: use the network when online so updates arrive straight away, saved copy when offline
     e.respondWith(fetch(e.request).then((res) => { if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); } return res; })
       .catch(() => caches.match(e.request, { ignoreSearch: true })));
