@@ -32,6 +32,13 @@
           "accept": [
             "image/*"
           ]
+        },
+        {
+          "name": "pack",
+          "accept": [
+            "application/json",
+            ".json"
+          ]
         }
       ]
     }

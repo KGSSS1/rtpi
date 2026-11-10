@@ -1,5 +1,5 @@
 // Offline cache: after the first visit the app, models and runtime load from the phone.
-const CACHE = 'rtpi-v6';
+const CACHE = 'rtpi-v7';
 const FILES = ['./', 'index.html', 'app.js', 'rec-worker.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-180.png',
   'vendor/ort.wasm.min.js', 'vendor/ort-wasm-simd-threaded.mjs'];
 // the large model and runtime files are downloaded and kept by the page itself (cache 'rtpi-assets-…')
@@ -11,12 +11,16 @@ self.addEventListener('activate', (e) => {
 });
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  // a photo shared to RTPI from another app (Android share menu)
+  // a photo or a face pack shared to RTPI from another app (Android share menu)
   if (e.request.method === 'POST' && url.pathname.endsWith('/share-target')) {
     e.respondWith((async () => {
       try {
-        const form = await e.request.formData(); const file = form.get('image');
-        if (file) await (await caches.open('rtpi-share')).put('shared-image', new Response(file, { headers: { 'content-type': file.type || 'image/jpeg' } }));
+        const form = await e.request.formData(); const cache = await caches.open('rtpi-share');
+        for (const file of [...form.getAll('image'), ...form.getAll('pack')]) {
+          if (!file || !file.size) continue;
+          const isPack = /json/.test(file.type) || /\.json$/i.test(file.name || '');
+          await cache.put(isPack ? 'shared-pack' : 'shared-image', new Response(file, { headers: { 'content-type': file.type || (isPack ? 'application/json' : 'image/jpeg') } }));
+        }
       } catch (err) { /* fall through to the app */ }
       return Response.redirect(new URL('./?shared=1', self.registration.scope).href, 303);
     })());

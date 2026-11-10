@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-v="6">
+<html lang="en" data-v="7">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -54,7 +54,7 @@ button { cursor: pointer; }
 
 .mark { font-weight: 750; letter-spacing: .14em; font-size: 13px; }
 .mark i { font-style: normal; color: var(--known); }
-.chip { font: 12px/1 var(--mono); color: var(--muted); background: rgba(23,27,34,.7);
+.chip { font: 12px/1.2 var(--mono); color: var(--muted); background: rgba(23,27,34,.7);
   border: 1px solid var(--line); border-radius: 99px; padding: 6px 10px; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; min-width: 0; font-variant-numeric: tabular-nums; }
 .chip b { color: var(--text); font-weight: 600; }
@@ -165,6 +165,29 @@ input[type=range] { width: 100%; accent-color: var(--known); }
 .res .sc { font: 12px/1 var(--mono); color: var(--known); font-variant-numeric: tabular-nums; }
 .res:not(.known) .sc { color: var(--muted); }
 .back { justify-self: start; }
+.res.maybe { border-style: dashed; border-color: var(--known); }
+.res.maybe .n { color: var(--known); }
+#prep { position: fixed; left: 16px; right: 16px; top: calc(env(safe-area-inset-top, 0px) + 70px); z-index: 5; max-width: 420px; margin-inline: auto;
+  background: rgba(23,27,34,.82); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; display: grid; gap: 6px;
+  font: 12px/1.2 var(--mono); color: var(--text); font-variant-numeric: tabular-nums; backdrop-filter: blur(8px); }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; background: var(--panel-2); border-radius: 10px; padding: 4px; margin-bottom: 14px; }
+.tabs button { border: 0; background: none; border-radius: 7px; padding: 8px; font-weight: 600; color: var(--muted); }
+.tabs button.on { background: var(--panel); color: var(--text); box-shadow: 0 0 0 1px var(--line); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chipb { border: 1px solid var(--line); background: var(--panel-2); border-radius: 99px; padding: 5px 11px; font-size: 13px; color: var(--text); }
+.chipb.on { background: var(--known); border-color: var(--known); color: var(--known-ink); font-weight: 600; }
+.chipb.static { font-size: 12px; padding: 3px 9px; color: var(--muted); }
+.bulk { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.list .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--known); margin-left: 7px; vertical-align: middle; }
+.list .h.warn { color: var(--known); white-space: normal; }
+.list .day { font: 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 12px 6px 4px; }
+.notes { margin: 0; color: var(--text); opacity: .9; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--line); padding-left: 10px; }
+.fb { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; }
+.fb span { flex: 1 1 120px; color: var(--muted); }
+.fb .btn { padding: 8px 18px; }
+.strip .mk { position: absolute; left: 0; right: 0; bottom: 0; border: 0; border-radius: 0 0 10px 10px; background: rgba(14,17,22,.78); color: var(--text); font: 10px/1 var(--mono); padding: 4px 0; }
+.strip figcaption.top { bottom: auto; top: 4px; }
+textarea { width: 100%; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; color: var(--text); font: inherit; resize: vertical; }
 @media (prefers-reduced-motion: reduce) { .sheet, .sheet[hidden], .progress > div { transition: none; } }
 </style>
 </head>
@@ -185,6 +208,11 @@ input[type=range] { width: 100%; accent-color: var(--known); }
     <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
   </button>
 </header>
+
+<div id="prep" hidden>
+  <span id="prep-text"></span>
+  <div class="progress"><div id="prep-bar"></div></div>
+</div>
 
 <nav class="bar bottom">
   <button class="icon-btn" id="btn-people" aria-label="People">
@@ -220,15 +248,33 @@ input[type=range] { width: 100%; accent-color: var(--known); }
   <div class="grab"></div>
   <h3 id="people-title">People</h3>
   <p class="sub" id="people-sub">Stored only on this phone.</p>
-  <div class="stack">
+  <div class="tabs">
+    <button type="button" id="tab-people" class="on">People</button>
+    <button type="button" id="tab-history">History</button>
+  </div>
+  <div class="stack" id="pane-people">
     <div class="row">
       <button class="btn primary" id="btn-import">Import face pack</button>
       <button class="btn" id="btn-export">Export</button>
     </div>
+    <small class="hint">Quicker: in Drive, Files or WhatsApp, share the face pack file to RTPI and it imports straight away.</small>
     <input type="file" id="file-pack" accept=".json,application/json" hidden>
-    <input type="search" id="people-search" placeholder="Search name, college, company…" aria-label="Search people">
+    <label class="field" id="scope-field" hidden>Recognise
+      <select id="scope"></select>
+    </label>
+    <div class="chips" id="people-chips"></div>
+    <input type="search" id="people-search" placeholder="Search name, college, tag, notes…" aria-label="Search people">
+    <div class="bulk" id="bulk" hidden>
+      <input type="text" id="bulk-tag" placeholder="Tag for the people shown" aria-label="Tag for the people shown">
+      <button type="button" class="btn" id="bulk-apply">Tag shown</button>
+    </div>
     <div class="list" id="people-list"></div>
     <button class="btn danger" id="btn-clear">Delete everyone from this phone</button>
+  </div>
+  <div class="stack" id="pane-history" hidden>
+    <input type="search" id="hist-search" placeholder="Search history by name" aria-label="Search history">
+    <div class="list" id="hist-list"></div>
+    <button class="btn danger" id="btn-clear-hist">Clear history</button>
   </div>
 </section>
 
@@ -310,14 +356,27 @@ input[type=range] { width: 100%; accent-color: var(--known); }
         <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="5">5</option>
       </select>
     </label>
+    <div class="setting" id="calib">
+      <div class="lbl"><span>Suggested threshold</span><span class="val" id="calib-val"></span></div>
+      <small id="calib-text"></small>
+      <div class="row">
+        <button type="button" class="btn primary" id="calib-apply" hidden>Use suggested threshold</button>
+        <button type="button" class="btn" id="calib-reset" hidden>Forget answers</button>
+      </div>
+    </div>
     <label class="toggle"><span>Show match scores on screen</span><input type="checkbox" id="s-scores"></label>
-    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded. · v6</p>
+    <label class="toggle"><span>Show "Possibly" for near matches</span><input type="checkbox" id="s-maybe"></label>
+    <div class="setting">
+      <label class="toggle"><span>Learn from very confident matches</span><input type="checkbox" id="s-learn"></label>
+      <small>Saves a person's current look as an extra photo when the match is very strong. Up to 5 each; you can remove them on their card.</small>
+    </div>
+    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded. · v7</p>
   </div>
 </section>
 
 <div id="toast" hidden></div>
 
 <script src="vendor/ort.wasm.min.js"></script>
-<script src="app.js?v=6"></script>
+<script src="app.js?v=7"></script>
 </body>
 </html>

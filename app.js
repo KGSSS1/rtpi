@@ -4,7 +4,7 @@
    -> cosine match against the local people list. */
 'use strict';
 
-const APP_V = '6';
+const APP_V = '7';
 // Never sit silently on the loading screen: show any startup error.
 let started = false; // once the camera loop runs, errors are logged instead of taking over the screen
 function fatal(msg) {
@@ -37,7 +37,10 @@ if (document.documentElement.dataset.v !== APP_V) {
 const $ = (s) => document.querySelector(s);
 const ARC = [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]];
 const DIM = 512;
-const DEFAULTS = { model: 'accurate', thr_accurate: 0.40, thr_fast: 0.42, margin: 0.05, det: 384, max: 3, scores: false, facing: 'user' };
+const DEFAULTS = { model: 'accurate', thr_accurate: 0.40, thr_fast: 0.42, margin: 0.05, det: 384, max: 3, scores: false, facing: 'user', maybe: true, learn: false, scope: '' };
+const MAYBE_BAND = 0.05;   // how far below the threshold a match is still shown as "Possibly …"
+const SHARP_MIN = 12;      // below this the aligned face is too blurred to trust (variance of Laplacian)
+const SHARP_GOOD = 40;     // sharp enough to keep as a learned photo
 const MODELS = {
   // split into ~11 MB parts to stay well under GitHub's web-upload size limit
   accurate: { key: 'emb_r50', name: 'Accurate', parts: [1, 2, 3, 4].map((i) => ({ url: `models/r50_int8.onnx.00${i}`, size: i < 4 ? 10947145 : 10947144 })) },
@@ -53,11 +56,15 @@ const app = {
   stream: null, running: false,
   tracks: [], nextTrackId: 1, hits: [],
   fps: 0, frameW: 0, frameH: 0,
-  last: null,              // last processed frame canvas snapshot info for "add from camera"
   addDraft: null,
+  hist: [], lastLog: new Map(), lastLearn: new Map(),
+  indexV: 0, look: { v: -1, map: new Map(), busy: null },
+  bfGen: 0, bfBusy: false, bfFailed: new WeakSet(),
+  pFilter: '', pTab: 'people', card: null,
 };
 
 if (!MODELS[app.settings.model]) app.settings.model = 'accurate';
+app.fb = load('rtpi-fb', { accurate: [], fast: [] });   // answers to "Is this …?": [score, 1 right | 0 wrong]
 
 /* ---------- small utils ---------- */
 function load(key, def) { try { return { ...def, ...JSON.parse(localStorage.getItem(key) || '{}') }; } catch { return { ...def }; } }
@@ -78,14 +85,18 @@ const DB = {
   db: null,
   open() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open('rtpi', 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('people', { keyPath: 'id' });
+      const r = indexedDB.open('rtpi', 2);
+      r.onupgradeneeded = () => {
+        const d = r.result;
+        if (!d.objectStoreNames.contains('people')) d.createObjectStore('people', { keyPath: 'id' });
+        if (!d.objectStoreNames.contains('history')) d.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
+      };
       r.onsuccess = () => { this.db = r.result; res(); }; r.onerror = () => rej(r.error);
     });
   },
-  tx(mode, fn) {
+  tx(mode, fn, store = 'people') {
     return new Promise((res, rej) => {
-      const t = this.db.transaction('people', mode); const s = t.objectStore('people'); const out = fn(s);
+      const t = this.db.transaction(store, mode); const s = t.objectStore(store); const out = fn(s);
       t.oncomplete = () => res(out && out.result); t.onerror = () => rej(t.error);
     });
   },
@@ -93,13 +104,19 @@ const DB = {
   putMany(arr) { return this.tx('readwrite', (s) => arr.forEach((p) => s.put(p))); },
   del(id) { return this.tx('readwrite', (s) => s.delete(id)); },
   clear() { return this.tx('readwrite', (s) => s.clear()); },
+  histAll() { return this.tx('readonly', (s) => s.getAll(), 'history'); },
+  histAdd(row) { return this.tx('readwrite', (s) => s.add(row), 'history'); },
+  histDel(ids) { return this.tx('readwrite', (s) => ids.forEach((id) => s.delete(id)), 'history'); },
+  histClear() { return this.tx('readwrite', (s) => s.clear(), 'history'); },
 };
 
 // matching index for the active model; people without a fingerprint for it are filled in by backfill()
 const okEmb = (v) => v && v.length === DIM;
-function rebuildIndex() {
+const inScope = (p) => !app.settings.scope || (p.tags || []).includes(app.settings.scope);
+function rebuildIndex(resetTracks = true) {
   const key = embKey(), rows = [];
   for (const p of app.people) {
+    if (!inScope(p)) continue;
     if (okEmb(p[key])) rows.push([p, p[key]]);
     for (const x of p.extra || []) if (okEmb(x[key])) rows.push([p, x[key]]);
   }
@@ -107,8 +124,14 @@ function rebuildIndex() {
   app.mPeople = [...new Set(app.rowP)];
   const E = new Float32Array(rows.length * DIM);
   rows.forEach(([, v], i) => E.set(v instanceof Float32Array ? v : new Float32Array(v), i * DIM));
-  app.E = E;
-  app.tracks.forEach((t) => { t.emb = null; t.result = null; t.embAt = 0; });
+  app.E = E; app.indexV++;
+  if (resetTracks) app.tracks.forEach((t) => { t.emb = null; t.result = null; t.embAt = 0; });
+}
+
+function allTags() {
+  const m = new Map();
+  for (const p of app.people) for (const t of p.tags || []) m.set(t, (m.get(t) || 0) + 1);
+  return [...m].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
 async function reloadPeople() {
@@ -116,6 +139,7 @@ async function reloadPeople() {
   try { rows = (await DB.all()) || []; } catch (e) { console.warn('storage unavailable', e); rows = app.people; }
   rows.sort((a, b) => a.name.localeCompare(b.name));
   app.people = rows;
+  if (app.settings.scope && !allTags().some(([t]) => t === app.settings.scope)) { app.settings.scope = ''; save('rtpi-settings', app.settings); }
   rebuildIndex();
   $('#count-badge').textContent = rows.length; $('#count-badge').hidden = rows.length === 0;
   renderPeopleList();
@@ -170,7 +194,7 @@ function makeRecognizer(modelBuf) {
       embed(x, n) {
         return new Promise((res, rej) => { const id = ++seq; waiting.set(id, { res, rej, n }); rec.pending++; w.postMessage({ type: 'embed', id, x, n }, [x.buffer]); });
       },
-      close() { w.terminate(); },
+      close() { w.terminate(); waiting.forEach((j) => j.rej(new Error('recogniser closed'))); waiting.clear(); rec.pending = 0; },
     };
     w.onmessage = (e) => {
       const m = e.data;
@@ -309,10 +333,19 @@ function alignedPixels(src, pts) {
   return alignCtx.getImageData(0, 0, 112, 112).data;
 }
 
+// variance of the Laplacian over the centre of the aligned face (grey levels 0-255): low = blurred
+function sharpness(px) {
+  const g = new Float32Array(64 * 64);
+  for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) { const i = ((y + 24) * 112 + x + 24) * 4; g[y * 64 + x] = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]; }
+  let sum = 0, sq = 0, n = 0;
+  for (let y = 1; y < 63; y++) for (let x = 1; x < 63; x++) { const c = y * 64 + x, v = 4 * g[c] - g[c - 1] - g[c + 1] - g[c - 64] - g[c + 64]; sum += v; sq += v * v; n++; }
+  return sq / n - (sum / n) * (sum / n);
+}
+
 function alignedBatch(src, faces) {
   const n = 112 * 112, x = new Float32Array(faces.length * 3 * n);
   faces.forEach((f, k) => {
-    const px = alignedPixels(src, f.pts), o = k * 3 * n;
+    const px = alignedPixels(src, f.pts), o = k * 3 * n; f.sharp = sharpness(px);
     for (let i = 0, j = 0; i < n; i++, j += 4) { x[o + i] = (px[j] - 127.5) / 127.5; x[o + n + i] = (px[j + 1] - 127.5) / 127.5; x[o + 2 * n + i] = (px[j + 2] - 127.5) / 127.5; }
   });
   return x;
@@ -334,10 +367,58 @@ function matchTop(e, k = 3) {
   return [...best].map(([p, s]) => ({ p, s })).sort((a, b) => b.s - a.s).slice(0, k);
 }
 
-function match(e) {
-  const [a, b] = matchTop(e, 2);
-  const ok = !!a && a.s >= thr() && a.s - Math.max(b ? b.s : 0, 0) >= app.settings.margin;
-  return { person: ok ? a.p : null, closest: a ? a.p : null, score: a ? a.s : 0, second: b ? b.s : 0 };
+// sure: over the threshold and clearly ahead of the runner-up.
+// maybe: just under the threshold, or over it without a clear lead -> shown as "Possibly …"
+function classify(top) {
+  const [a, b] = top;
+  if (!a) return { person: null, maybe: null, closest: null, score: 0, second: 0 };
+  const lead = a.s - Math.max(b ? b.s : 0, 0), t = thr();
+  const sure = a.s >= t && lead >= app.settings.margin;
+  const maybe = !sure && app.settings.maybe && a.s >= t - MAYBE_BAND && lead >= Math.min(app.settings.margin, 0.03);
+  return { person: sure ? a.p : null, maybe: maybe ? a.p : null, closest: a.p, score: a.s, second: b ? b.s : 0 };
+}
+function match(e, deny) {
+  let top = matchTop(e, deny ? 3 + deny.size : 3);
+  if (deny) top = top.filter((t) => !deny.has(t.p.id));
+  return classify(top);
+}
+
+/* ---------- feedback, calibration, history ---------- */
+function recordFb(score, ok) {
+  const m = app.recModel || app.settings.model;
+  app.fb[m] = [...(app.fb[m] || []), [+(+score).toFixed(3), ok ? 1 : 0]].slice(-500);
+  save('rtpi-fb', app.fb); renderCalib();
+}
+// threshold that would have made the fewest mistakes on the answers so far (a wrong name counts double a miss)
+function calib(model) {
+  const a = app.fb[model] || [], G = a.filter((x) => x[1]).map((x) => x[0]), I = a.filter((x) => !x[1]).map((x) => x[0]);
+  const out = { n: a.length, g: G.length, i: I.length, thr: null };
+  if (G.length < 10 || I.length < 3) return out;
+  let best = Infinity, lo = 0, hi = 0, open = false;
+  for (let k = 25; k <= 65; k++) {
+    const t = k / 100, cost = G.filter((x) => x < t).length + 2 * I.filter((x) => x >= t).length;
+    if (cost < best) { best = cost; lo = hi = t; open = true; } else if (cost === best && open) hi = t; else open = false;
+  }
+  out.thr = Math.round(((lo + hi) / 2) * 100) / 100;
+  out.missed = G.filter((x) => x < out.thr).length; out.wrong = I.filter((x) => x >= out.thr).length;
+  return out;
+}
+function renderCalib() {
+  const m = app.recModel || app.settings.model, c = calib(m), el = $('#calib-text'); if (!el) return;
+  $('#calib-val').textContent = c.thr != null ? c.thr.toFixed(2) : '';
+  $('#calib-apply').hidden = c.thr == null || Math.abs(c.thr - thr()) < 0.005; $('#calib-reset').hidden = !c.n;
+  if (!c.n) el.textContent = 'Answer "Is this …?" on results and the app works out the best threshold for your list.';
+  else if (c.thr == null) el.textContent = `${c.n} answers so far (${c.g} right, ${c.i} wrong or not in your list). A suggestion needs at least 10 right and 3 wrong.`;
+  else el.textContent = `From ${c.n} answers: at ${c.thr.toFixed(2)} the app would have missed ${c.missed} of ${c.g} right matches and let through ${c.wrong} of ${c.i} wrong ones. You are using ${thr().toFixed(2)}.`;
+}
+
+function logSeen(p, score, src, tier) {
+  const now = Date.now();
+  if (src === 'live') { if (now - (app.lastLog.get(p.id) || 0) < 5 * 60e3) return; app.lastLog.set(p.id, now); }
+  const row = { t: now, pid: p.id, name: p.name, score: +score.toFixed(3), model: app.recModel, src, tier };
+  app.hist.push(row);
+  DB.histAdd(row).catch(() => {});
+  if (openSheetEl === $('#sheet-people') && app.pTab === 'history') renderHistory();
 }
 
 /* ---------- camera ---------- */
@@ -396,7 +477,7 @@ function associate(faces) {
   faces.forEach((f) => {
     let bestT = null, bestI = 0.25;
     for (const t of app.tracks) { if (used.has(t)) continue; const v = iou(t.box, f.box); if (v > bestI) { bestI = v; bestT = t; } }
-    const t = bestT || { id: app.nextTrackId++, emb: null, seen: 0, embAt: 0, busy: false };
+    const t = bestT || { id: app.nextTrackId++, emb: null, seen: 0, embAt: 0, busy: false, firstSeen: performance.now(), hint: '' };
     used.add(t); t.box = f.box; t.pts = f.pts; t.missed = 0;
     next.push(t);
   });
@@ -408,32 +489,76 @@ function associate(faces) {
 // smooth the identity over several recognitions: running mean of embeddings, re-normalised
 function applyEmbedding(t, e) {
   let same = 0; if (t.emb) for (let d = 0; d < DIM; d++) same += t.emb[d] * e[d];
-  if (!t.emb || same < 0.4) { t.emb = Float32Array.from(e); t.seen = 0; } // a different face in this spot: start fresh
+  if (!t.emb || same < 0.4) { t.emb = Float32Array.from(e); t.seen = 0; t.deny = null; t.confirmed = null; } // a different face in this spot: start fresh
   else { const w = Math.min(t.seen, 4); for (let d = 0; d < DIM; d++) t.emb[d] = t.emb[d] * w + e[d]; normalize(t.emb); }
-  t.seen++; t.raw = e; t.result = match(t.emb);
+  t.seen++; t.raw = e;
+  const r = match(t.emb, t.deny);
+  if (t.confirmed && (r.maybe === t.confirmed || r.person === t.confirmed)) { r.person = t.confirmed; r.maybe = null; } // you said yes to a "Possibly"
+  t.result = r;
+  if (r.person && t.seen >= 2) { logSeen(r.person, r.score, 'live', 'known'); learn(t); }
+}
+
+// Self-learning (off unless enabled): keep a very confident, sharp, new-looking view as an extra photo. Up to 5 per person.
+function learn(t) {
+  if (!app.settings.learn) return;
+  const r = t.result, p = r.person, key = embKey();
+  if (!p || t.seen < 3 || !(t.sharp >= SHARP_GOOD) || quickIssue(t)) return;
+  if (r.score < Math.max(0.6, thr() + 0.2) || r.score - r.second < 0.2) return;
+  if ((p.extra || []).filter((x) => String(x.id).startsWith('auto:')).length >= 5) return;
+  if (Date.now() - (app.lastLearn.get(p.id) || 0) < 10 * 60e3) return;
+  let mx = 0;
+  for (const v of [p[key], ...(p.extra || []).map((x) => x[key])]) if (okEmb(v)) { let s = 0; for (let d = 0; d < DIM; d++) s += v[d] * t.raw[d]; if (s > mx) mx = s; }
+  if (mx > 0.8 || mx < 0.55) return;   // nothing new to learn, or this single frame is not convincing on its own
+  const snap = snapshotTrack(t); if (!snap) return;
+  app.lastLearn.set(p.id, Date.now());
+  const x = { id: 'auto:' + Date.now().toString(36), thumb: snap.thumb, added: new Date().toISOString().slice(0, 10) }; x[key] = snap.emb;
+  p.extra = [...(p.extra || []), x];
+  DB.putMany([p]).catch(() => {});
+  rebuildIndex(false);
+}
+
+// quick checks that need no model: is the face big enough and roughly facing the camera?
+function quickIssue(t) {
+  if (t.box[2] - t.box[0] < 56) return 'Move closer';
+  const [a, b, n] = t.pts, dx = b[0] - a[0], dy = b[1] - a[1], ed2 = dx * dx + dy * dy || 1;
+  const off = Math.abs(((n[0] - (a[0] + b[0]) / 2) * dx + (n[1] - (a[1] + b[1]) / 2) * dy) / ed2);
+  return off > 0.42 ? 'Face the camera' : '';
 }
 
 // Accurate: one face at a time, newest/unnamed first, each refreshed every ~1.5 s.
 // Fast: every face (up to the setting) on every frame.
+// Poor frames (small, turned or blurred faces) are skipped while a better one is likely to come:
+// up to 1.2 s for a new face, up to 6 s for a face that already has a name.
 function scheduleRecognition() {
   if (!app.rec || app.rec.pending > 0) return;
   const live = app.tracks.filter((t) => !t.missed && !t.busy);
   if (!live.length) return;
-  const now = performance.now(); let pick;
-  if (app.recModel === 'fast') pick = live.slice(0, +app.settings.max);
+  const now = performance.now(); let cand, limit;
+  if (app.recModel === 'fast') { cand = live; limit = +app.settings.max; }
   else {
-    const due = live.filter((t) => !t.emb || now - t.embAt > 1500);
-    due.sort((a, b) => (a.emb ? 1 : 0) - (b.emb ? 1 : 0) || a.embAt - b.embAt);
-    pick = due.slice(0, 1);
+    cand = live.filter((t) => !t.emb || now - t.embAt > 1500);
+    cand.sort((a, b) => (a.emb ? 1 : 0) - (b.emb ? 1 : 0) || a.embAt - b.embAt); limit = 1;
+  }
+  const canWait = (t) => (t.emb ? now - t.embAt < 6000 : now - t.firstSeen < 1200);
+  const pick = [];
+  for (const t of cand) {
+    const issue = quickIssue(t);
+    if (issue && canWait(t)) { t.hint = issue; continue; }
+    pick.push(t); if (pick.length >= limit) break;
   }
   if (!pick.length) return;
-  const x = alignedBatch(frameCanvas, pick);
-  pick.forEach((t) => { t.busy = true; });
+  const all = alignedBatch(frameCanvas, pick), n = 3 * 112 * 112;
+  const keep = pick.filter((t) => !(t.sharp < SHARP_MIN && canWait(t)));
+  pick.forEach((t) => { t.hint = keep.includes(t) ? '' : 'Hold still'; });
+  if (!keep.length) return;
+  let x = all;
+  if (keep.length !== pick.length) { x = new Float32Array(keep.length * n); keep.forEach((t, i) => x.set(all.subarray(pick.indexOf(t) * n, (pick.indexOf(t) + 1) * n), i * n)); }
+  keep.forEach((t) => { t.busy = true; });
   const model = app.recModel;
-  app.rec.embed(x, pick.length).then((embs) => {
-    pick.forEach((t, i) => { t.busy = false; t.embAt = performance.now(); if (model === app.recModel) applyEmbedding(t, embs[i]); });
+  app.rec.embed(x, keep.length).then((embs) => {
+    keep.forEach((t, i) => { t.busy = false; t.embAt = performance.now(); if (model === app.recModel) applyEmbedding(t, embs[i]); });
     draw();
-  }).catch((e) => { pick.forEach((t) => (t.busy = false)); console.error(e); });
+  }).catch((e) => { keep.forEach((t) => (t.busy = false)); if (!/closed/.test(e.message)) console.error(e); });
 }
 
 /* ---------- overlay ---------- */
@@ -469,29 +594,32 @@ function draw() {
   for (const t of app.tracks) {
     if (t.missed > 0 && !t.result?.person) continue;
     const [x1, y1, x2, y2] = toScreen(t.box); const w = x2 - x1, h = y2 - y1;
-    const r = t.result || {}; const isKnown = !!r.person; const col = isKnown ? known : unknown;
-    // corner brackets
+    const r = t.result || {}; const isKnown = !!r.person, isMaybe = !isKnown && !!r.maybe; const col = isKnown || isMaybe ? known : unknown;
+    // corner brackets (dashed for a "Possibly")
     const L = Math.max(12, Math.min(w, h) * 0.22);
-    octx.strokeStyle = col; octx.lineWidth = isKnown ? 3 : 2; octx.lineCap = 'round'; octx.beginPath();
+    octx.strokeStyle = col; octx.lineWidth = isKnown ? 3 : 2; octx.lineCap = 'round'; octx.setLineDash(isMaybe ? [5, 6] : []); octx.beginPath();
     [[x1, y1, 1, 1], [x2, y1, -1, 1], [x1, y2, 1, -1], [x2, y2, -1, -1]].forEach(([x, y, dx, dy]) => { octx.moveTo(x + dx * L, y); octx.lineTo(x, y); octx.lineTo(x, y + dy * L); });
-    octx.stroke();
+    octx.stroke(); octx.setLineDash([]);
     // name tag
     const tagW = Math.max(150, Math.min(280, w * 1.4)), pad = 10;
     let title, line2;
     if (isKnown) { title = r.person.name; line2 = r.person.headline || r.person.organisation || ''; }
+    else if (isMaybe) { title = 'Possibly ' + r.maybe.name; line2 = 'Tap to confirm'; }
     else if (!app.people.length) { title = 'Face found'; line2 = 'Import your face pack to name people'; }
-    else if (!t.result) { title = 'Identifying…'; line2 = ''; }
+    else if (!t.result) { title = t.hint ? t.hint + '…' : 'Identifying…'; line2 = ''; }
     else { title = 'Unknown'; line2 = app.settings.scores && r.closest ? `closest: ${r.closest.name}` : 'Tap to add'; }
     if (app.settings.scores && r.closest && t.result) title += `  ${r.score.toFixed(2)}`;
     octx.font = '700 15px ' + css.getPropertyValue('--ui'); const t1 = fit(title, tagW - pad * 2);
     octx.font = '13px ' + css.getPropertyValue('--ui'); const t2 = line2 ? fit(line2, tagW - pad * 2) : '';
     const tagH = t2 ? 46 : 28;
     let tx = (x1 + x2) / 2 - tagW / 2; tx = Math.max(8, Math.min(cw - tagW - 8, tx));
-    let ty = y2 + 10; if (ty + tagH > ch - 110) ty = Math.max(70, y1 - tagH - 10);
+    let ty = y2 + 10; if (ty + tagH > ch - 110) ty = Math.max(96, y1 - tagH - 10);
     octx.fillStyle = isKnown ? known : 'rgba(23,27,34,.86)';
     octx.beginPath(); octx.roundRect(tx, ty, tagW, tagH, 10); octx.fill();
-    octx.fillStyle = isKnown ? css.getPropertyValue('--known-ink') : css.getPropertyValue('--text');
+    if (isMaybe) { octx.strokeStyle = known; octx.lineWidth = 1; octx.stroke(); }
+    octx.fillStyle = isKnown ? css.getPropertyValue('--known-ink') : isMaybe ? known : css.getPropertyValue('--text');
     octx.font = '700 15px ' + css.getPropertyValue('--ui'); octx.textBaseline = 'top'; octx.fillText(t1, tx + pad, ty + 7);
+    octx.fillStyle = isKnown ? css.getPropertyValue('--known-ink') : css.getPropertyValue('--text');
     if (t2) { octx.globalAlpha = 0.8; octx.font = '13px ' + css.getPropertyValue('--ui'); octx.fillText(t2, tx + pad, ty + 26); octx.globalAlpha = 1; }
     app.hits.push({ rect: [Math.min(x1, tx), Math.min(y1, ty), Math.max(x2, tx + tagW), Math.max(y2, ty + tagH)], track: t });
   }
@@ -501,15 +629,21 @@ overlay.addEventListener('click', (ev) => {
   const h = app.hits.find(({ rect: [a, b, c, d] }) => ev.clientX >= a && ev.clientX <= c && ev.clientY >= b && ev.clientY <= d);
   if (!h) return;
   const r = h.track.result || {};
-  if (r.person) openPerson(r.person, r.score, false, snapshotTrack(h.track));
+  if (r.person) openPerson(r.person, { score: r.score, face: snapshotTrack(h.track), tier: 'known', track: h.track });
+  else if (r.maybe) openPerson(r.maybe, { score: r.score, face: snapshotTrack(h.track), tier: 'maybe', track: h.track });
   else openAdd(snapshotTrack(h.track));
 });
 
 /* ---------- status + notice ---------- */
 function setStatus() {
-  const n = app.people.length, named = app.tracks.filter((t) => t.result?.person && !t.missed).length;
-  const bf = app.backfill ? ` · updating ${app.backfill.done}/${app.backfill.total}` : '';
-  $('#status').innerHTML = `<b>${n}</b> people · ${MODELS[app.recModel || app.settings.model].name} · ${app.fps.toFixed(0)} fps${named ? ` · <b>${named}</b> named` : ''}${bf}`;
+  const m = app.recModel || app.settings.model, sc = app.settings.scope;
+  $('#status').innerHTML = `<b>${sc ? app.mPeople.length : app.people.length}</b>${sc ? ' ' + esc(sc) : ''} · ${MODELS[m].name} · ${app.fps.toFixed(0)} fps`;
+}
+// progress of preparing fingerprints, on its own line under the top bar
+function showPrep() {
+  const b = app.backfill, el = $('#prep'); el.hidden = !b; if (!b) return;
+  $('#prep-text').textContent = `Preparing ${MODELS[b.model].name} model: ${b.done} of ${b.total} photos`;
+  $('#prep-bar').style.width = (b.total ? (b.done / b.total) * 100 : 0).toFixed(1) + '%';
 }
 function showNotice(title, text, actions = [], progress = false) {
   $('#notice').hidden = false; $('#notice-title').textContent = title; $('#notice-text').textContent = text;
@@ -532,10 +666,17 @@ function closeSheet() { if (openSheetEl) openSheetEl.hidden = true; openSheetEl 
 $('#scrim').onclick = closeSheet;
 addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
 
-function openPerson(p, score, fromPhoto = false, face = null) {
-  const t0 = thr();
+function openPerson(p, o = {}) {
+  const { score = null, fromPhoto = false, face = null, tier = 'known', track = null, row = null } = o;
+  app.card = { p, score, fromPhoto, tier, track, row, answered: false };
   app.cardPerson = p; app.cardFace = face && okEmb(face.emb) ? face : null;
-  const n = 1 + (p.extra || []).length;
+  renderCard();
+  openSheet('#sheet-person');
+}
+
+function renderCard() {
+  const { p, score, fromPhoto, tier, answered } = app.card, t0 = thr();
+  const n = 1 + (p.extra || []).length, first = p.name.split(' ')[0];
   $('#person-body').innerHTML = `${fromPhoto ? '<button class="btn back" id="btn-back-photo">← Back to photo</button>' : ''}
     <div class="person">
       <img src="${esc(p.thumb)}" alt="">
@@ -545,7 +686,10 @@ function openPerson(p, score, fromPhoto = false, face = null) {
         <div class="meta">${[p.organisation, p.location].filter(Boolean).map(esc).join(' · ')}</div>
       </div>
     </div>
-    ${score != null ? `<div class="match"><span>match</span><div class="meter"><div style="width:${Math.max(0, Math.min(1, score)) * 100}%"></div><i style="left:${t0 * 100}%"></i></div><span>${score.toFixed(2)}</span></div>` : ''}
+    ${(p.tags || []).length ? `<div class="chips">${p.tags.map((t) => `<span class="chipb static">${esc(t)}</span>`).join('')}</div>` : ''}
+    ${p.notes ? `<p class="notes">${esc(p.notes)}</p>` : ''}
+    ${score != null ? `<div class="match"><span>${tier === 'maybe' ? 'possible' : 'match'}</span><div class="meter"><div style="width:${Math.max(0, Math.min(1, score)) * 100}%"></div><i style="left:${t0 * 100}%"></i></div><span>${score.toFixed(2)}</span></div>
+    <div class="fb" id="fb-row">${answered ? '<span>Answer recorded.</span>' : `<span>Is this ${esc(first)}?</span><button class="btn" id="fb-yes">Yes</button><button class="btn" id="fb-no">No</button>`}</div>` : ''}
     ${p.link ? `<a class="link" href="${esc(p.link)}" target="_blank" rel="noopener">${esc(p.link.replace(/^https?:\/\/(www\.)?/, ''))}</a>` : ''}
     <div class="photos">
       <div class="photos-head"><span>Photos used for recognition</span><span class="count">${n}</span></div>
@@ -556,13 +700,31 @@ function openPerson(p, score, fromPhoto = false, face = null) {
       </div>
       <small class="hint">More photos of the same person, from different angles and lighting, make recognition more reliable.</small>
     </div>
-    <button class="btn danger" id="btn-del-person">Remove from this phone</button>`;
+    <div class="row">
+      <button class="btn" id="btn-edit-person">Edit details, tags and notes</button>
+      <button class="btn danger" id="btn-del-person">Remove from this phone</button>
+    </div>`;
   renderStrip(p);
-  if (app.cardFace) $('#btn-save-face').onclick = () => addExtra(p, app.cardFace);
+  if ($('#fb-yes')) { $('#fb-yes').onclick = () => answer(true); $('#fb-no').onclick = () => answer(false); }
+  if ($('#btn-save-face')) $('#btn-save-face').onclick = () => addExtra(p, app.cardFace);
   $('#btn-add-extra').onclick = () => $('#file-extra').click();
-  if (fromPhoto) $('#btn-back-photo').onclick = () => openSheet('#sheet-photo');
+  $('#btn-edit-person').onclick = () => editPerson(p);
+  if (fromPhoto) $('#btn-back-photo').onclick = () => { renderPhoto(); openSheet('#sheet-photo'); };
   armButton($('#btn-del-person'), 'Tap again to remove', async () => { await DB.del(p.id); await reloadPeople(); closeSheet(); toast(`Removed ${p.name}`); });
-  openSheet('#sheet-person');
+}
+
+// "Is this …?" — every answer feeds the threshold calibration
+function answer(ok) {
+  const c = app.card; if (!c || c.answered || c.score == null) return;
+  c.answered = true; recordFb(c.score, ok);
+  const row = $('#fb-row'); if (row) row.innerHTML = `<span>${ok ? 'Noted as right.' : 'Noted as wrong. This face will not be named as them again here.'}</span>`;
+  if (ok) {
+    if (c.tier === 'maybe') { if (c.track) { c.track.confirmed = c.p; if (c.track.result) { c.track.result.person = c.p; c.track.result.maybe = null; } } if (c.row) { c.row.person = c.p; c.row.maybe = null; } logSeen(c.p, c.score, c.row ? 'photo' : 'live', 'confirmed'); }
+  } else {
+    if (c.track) { (c.track.deny ||= new Set()).add(c.p.id); c.track.confirmed = null; if (c.track.emb) c.track.result = match(c.track.emb, c.track.deny); }
+    if (c.row) { c.row.person = null; c.row.maybe = null; c.row.top = c.row.top.filter((t) => t.p !== c.p); }
+    app.cardFace = null; $('#btn-save-face')?.remove();
+  }
 }
 
 function renderStrip(p) {
@@ -570,14 +732,25 @@ function renderStrip(p) {
   const main = document.createElement('figure'); main.innerHTML = `<img src="${esc(p.thumb)}" alt=""><figcaption>Main</figcaption>`; strip.append(main);
   (p.extra || []).forEach((x) => {
     const f = document.createElement('figure');
-    f.innerHTML = `<img src="${esc(x.thumb)}" alt=""><button class="rm" aria-label="Remove this photo">×</button>`;
-    const b = f.querySelector('.rm');
-    armButton(b, '?', async () => {
+    f.innerHTML = `<img src="${esc(x.thumb)}" alt="">${String(x.id).startsWith('auto:') ? '<figcaption class="top">learned</figcaption>' : ''}<button class="rm" aria-label="Remove this photo">×</button><button class="mk" aria-label="Use as main photo">Main</button>`;
+    armButton(f.querySelector('.rm'), '?', async () => {
       p.extra = p.extra.filter((y) => y !== x); await DB.putMany([p]).catch(() => {});
-      rebuildIndex(); renderStrip(p); toast('Photo removed');
+      rebuildIndex(false); renderStrip(p); toast('Photo removed');
     });
+    f.querySelector('.mk').onclick = () => makeMain(p, x);
     strip.append(f);
   });
+  const cnt = $('.photos .count'); if (cnt) cnt.textContent = 1 + (p.extra || []).length;
+}
+
+// swap an extra photo with the main one (the picture shown everywhere for this person)
+async function makeMain(p, x) {
+  const old = { id: 'ph:' + Date.now().toString(36), thumb: p.thumb, added: '' };
+  for (const k of ['emb', 'emb_r50']) { if (okEmb(p[k])) old[k] = p[k]; if (okEmb(x[k])) p[k] = x[k]; else delete p[k]; }
+  p.thumb = x.thumb; p.keepPhoto = true; delete p.face_px;
+  p.extra = p.extra.map((y) => (y === x ? old : y));
+  await DB.putMany([p]).catch(() => {});
+  rebuildIndex(false); renderCard(); renderPeopleList(); toast('Main photo changed'); backfill();
 }
 
 // add another photo (template) to a person
@@ -588,11 +761,48 @@ async function addExtra(p, face) {
   x[key] = face.emb;
   p.extra = [...(p.extra || []), x];
   await DB.putMany([p]).catch(() => {});
-  rebuildIndex(); renderStrip(p);
-  if (app.cardFace === face) { app.cardFace = null; $('#btn-save-face')?.remove(); }
-  const cnt = $('.photos .count'); if (cnt) cnt.textContent = 1 + p.extra.length;
+  rebuildIndex(false);
+  const c = app.card;
+  if (c && c.p === p && app.cardFace === face) {
+    if (!c.answered && c.score != null) answer(true);   // saving the face means the name was right
+    app.cardFace = null; $('#btn-save-face')?.remove();
+  }
+  renderStrip(p);
   if (before && before.s < 0.2) toast(`Saved, but this face looks quite different from ${p.name}'s other photos (${before.s.toFixed(2)}). If it's someone else, remove it.`, 5000);
   else toast(`Saved. ${p.name} now has ${1 + p.extra.length} photos.`);
+  backfill();
+}
+
+// edit details, tags and notes on the phone; edited details are kept when a face pack is imported later
+function editPerson(p) {
+  $('#person-body').innerHTML = `<h3>Edit details</h3>
+    <form class="stack" id="edit-form" autocomplete="off">
+      <label class="field">Name<input type="text" id="e-name" required></label>
+      <label class="field">Headline<input type="text" id="e-headline"></label>
+      <label class="field">College / company<input type="text" id="e-org"></label>
+      <label class="field">Location<input type="text" id="e-location"></label>
+      <label class="field">Profile link<input type="url" id="e-link" placeholder="https://"></label>
+      <label class="field">Tags, separated by commas<input type="text" id="e-tags" placeholder="e.g. Section B, Finance Club"></label>
+      <label class="field">Notes<textarea id="e-notes" rows="3" placeholder="Where you met, what to remember"></textarea></label>
+      <div class="row"><button class="btn" type="button" id="e-cancel">Cancel</button><button class="btn primary" type="submit">Save</button></div>
+    </form>`;
+  const f = { name: '#e-name', headline: '#e-headline', organisation: '#e-org', location: '#e-location', link: '#e-link' };
+  for (const k in f) $(f[k]).value = p[k] || '';
+  $('#e-tags').value = (p.tags || []).join(', '); $('#e-notes').value = p.notes || '';
+  $('#e-cancel').onclick = renderCard;
+  $('#edit-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const name = $('#e-name').value.trim(); if (!name) return;
+    let changed = false;
+    for (const k in f) { const v = $(f[k]).value.trim(); if (v !== (p[k] || '')) { p[k] = v; changed = true; } }
+    if (changed) p.edited = true;
+    p.tags = [...new Set($('#e-tags').value.split(',').map((t) => t.trim()).filter(Boolean))];
+    p.notes = $('#e-notes').value.trim();
+    await DB.putMany([p]).catch(() => {});
+    app.people.sort((a, b) => a.name.localeCompare(b.name));
+    if (app.settings.scope && !allTags().some(([t]) => t === app.settings.scope)) { app.settings.scope = ''; save('rtpi-settings', app.settings); }
+    rebuildIndex(false); renderCard(); renderPeopleList(); toast('Saved');
+  };
 }
 
 function armButton(btn, armedLabel, fn) {
@@ -604,54 +814,157 @@ function armButton(btn, armedLabel, fn) {
   };
 }
 
-/* people list */
+/* people list: filters, needs-attention, tags */
+// who needs a look, and why
+function attention() {
+  const key = embKey(), m = new Map(), add = (p, why) => m.set(p, [...(m.get(p) || []), why]);
+  const avg = new Map();
+  for (const h of app.hist) if (h.model === app.recModel && h.tier === 'known') { const a = avg.get(h.pid) || [0, 0]; a[0] += h.score; a[1]++; avg.set(h.pid, a); }
+  const look = app.look.v === app.indexV ? app.look.map : null;
+  for (const p of app.people) {
+    if (!okEmb(p[key]) && (app.bfFailed.has(p) || !p.thumb)) add(p, 'No usable face in the main photo');   // ones still being prepared are not flagged
+    if (p.face_px && p.face_px < 110) add(p, 'Small face in the main photo');
+    const lk = look && look.get(p); if (lk) add(p, `Looks like ${lk.q.name} (${lk.s.toFixed(2)})`);
+    const a = avg.get(p.id); if (a && a[1] >= 2 && a[0] / a[1] < thr() + 0.07) add(p, `Weak matches so far (average ${(a[0] / a[1]).toFixed(2)})`);
+  }
+  return m;
+}
+// pairs of different people whose photos look alike to the current model (done in small steps so the camera keeps running)
+async function computeLookalikes() {
+  const v = app.indexV; if (app.look.v === v || app.look.busy === v) return; app.look.busy = v;
+  const E = app.E, P = app.rowP, R = P.length, map = new Map(), cut = thr() + 0.05;
+  for (let i = 0; i < R; i++) {
+    for (let j = i + 1; j < R; j++) {
+      if (P[i] === P[j]) continue;
+      let s = 0; const a = i * DIM, b = j * DIM; for (let d = 0; d < DIM; d++) s += E[a + d] * E[b + d];
+      if (s >= cut) for (const [x, y] of [[P[i], P[j]], [P[j], P[i]]]) { const c = map.get(x); if (!c || s > c.s) map.set(x, { q: y, s }); }
+    }
+    if (i % 30 === 29) { await sleep(0); if (app.indexV !== v) { if (app.look.busy === v) app.look.busy = null; return; } }
+  }
+  app.look = { v, map, busy: null };
+  if (openSheetEl === $('#sheet-people') && app.pTab === 'people') renderPeopleList();
+}
+
+function shownPeople(att) {
+  const q = ($('#people-search').value || '').toLowerCase().trim(), f = app.pFilter;
+  return app.people.filter((p) => (!q || [p.name, p.headline, p.organisation, p.location, p.notes, (p.tags || []).join(' ')].join(' ').toLowerCase().includes(q))
+    && (!f || (f === 'attention' ? att.has(p) : (p.tags || []).includes(f.slice(4)))));
+}
+
 function renderPeopleList() {
-  const q = ($('#people-search').value || '').toLowerCase().trim();
-  const list = $('#people-list'); list.innerHTML = '';
-  const rows = app.people.filter((p) => !q || [p.name, p.headline, p.organisation, p.location].join(' ').toLowerCase().includes(q));
+  const tags = allTags(), att = attention();
+  if (app.pFilter && (app.pFilter === 'attention' ? !att.size : !tags.some(([t]) => 'tag:' + t === app.pFilter))) app.pFilter = '';
+  const chips = $('#people-chips'); chips.innerHTML = '';
+  const chip = (label, val) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'chipb' + (app.pFilter === val ? ' on' : ''); b.textContent = label; b.onclick = () => { app.pFilter = val; renderPeopleList(); }; chips.append(b); };
+  chip(`All ${app.people.length}`, ''); if (att.size) chip(`Needs attention ${att.size}`, 'attention'); tags.forEach(([t, n]) => chip(`${t} ${n}`, 'tag:' + t));
+  chips.hidden = !app.people.length;
+  const sel = $('#scope'); sel.innerHTML = '';
+  [['', `Everyone (${app.people.length})`], ...tags.map(([t, n]) => [t, `Only "${t}" (${n})`])].forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; sel.append(o); });
+  sel.value = app.settings.scope || ''; $('#scope-field').hidden = !tags.length;
+  const rows = shownPeople(att);
   $('#people-title').textContent = `People (${app.people.length})`;
+  $('#bulk').hidden = !app.people.length; $('#bulk-apply').textContent = `Tag ${rows.length} shown`;
+  const list = $('#people-list'); list.innerHTML = '';
   const frag = document.createDocumentFragment();
   rows.slice(0, 400).forEach((p) => {
-    const b = document.createElement('button');
-    b.innerHTML = `<img loading="lazy" src="${esc(p.thumb)}" alt=""><span class="t"><div class="n">${esc(p.name)}</div><div class="h">${esc(p.headline || p.organisation || '')}</div></span>`;
+    const b = document.createElement('button'); const why = att.get(p);
+    const sub = app.pFilter === 'attention' && why ? why.join(' · ') : (p.headline || p.organisation || '');
+    b.innerHTML = `<img loading="lazy" src="${esc(p.thumb)}" alt=""><span class="t"><div class="n">${esc(p.name)}${why && app.pFilter !== 'attention' ? '<i class="dot" title="Needs attention"></i>' : ''}</div><div class="h${app.pFilter === 'attention' ? ' warn' : ''}">${esc(sub)}</div></span>`;
     b.onclick = () => openPerson(p);
     frag.append(b);
   });
   list.append(frag);
+  if (rows.length > 400) { const m = document.createElement('p'); m.className = 'sub'; m.textContent = `Showing the first 400 of ${rows.length}. Search to narrow it down.`; list.append(m); }
   if (!app.people.length) list.innerHTML = '<p class="sub">Nobody yet. Import face_pack.json, or add people one at a time with the + button.</p>';
+  else if (!rows.length) list.innerHTML = '<p class="sub">No one matches.</p>';
 }
 $('#people-search').addEventListener('input', renderPeopleList);
-$('#btn-people').onclick = () => { renderPeopleList(); openSheet('#sheet-people'); };
+$('#scope').onchange = (e) => { app.settings.scope = e.target.value; save('rtpi-settings', app.settings); rebuildIndex(); setStatus(); toast(e.target.value ? `Recognising only "${e.target.value}" (${app.mPeople.length} people)` : 'Recognising everyone'); };
+$('#bulk-tag').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bulk-apply').click(); } });
+$('#bulk-apply').onclick = async () => {
+  let tag = $('#bulk-tag').value.trim(); if (!tag) { toast('Type a tag first. Start it with - to remove that tag instead.'); return; }
+  const remove = tag.startsWith('-'); if (remove) tag = tag.slice(1).trim(); if (!tag) return;
+  const rows = shownPeople(attention());
+  rows.forEach((p) => { const s = new Set(p.tags || []); remove ? s.delete(tag) : s.add(tag); p.tags = [...s]; });
+  await DB.putMany(rows).catch(() => {});
+  $('#bulk-tag').value = '';
+  if (app.settings.scope && !allTags().some(([t]) => t === app.settings.scope)) { app.settings.scope = ''; save('rtpi-settings', app.settings); }
+  rebuildIndex(false); renderPeopleList(); toast(`${remove ? 'Removed' : 'Added'} "${tag}" ${remove ? 'from' : 'on'} ${rows.length} people`);
+};
+
+/* history: who was recognised and when (kept on this phone only) */
+function renderHistory() {
+  const q = ($('#hist-search').value || '').toLowerCase().trim(), byId = new Map(app.people.map((p) => [p.id, p]));
+  const rows = app.hist.filter((h) => !q || h.name.toLowerCase().includes(q)).slice(-400).reverse();
+  const list = $('#hist-list'); list.innerHTML = ''; let day = '';
+  const frag = document.createDocumentFragment();
+  rows.forEach((h) => {
+    const d = new Date(h.t), label = d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+    if (label !== day) { day = label; const hd = document.createElement('div'); hd.className = 'day'; hd.textContent = label; frag.append(hd); }
+    const p = byId.get(h.pid), b = document.createElement('button');
+    b.innerHTML = `<img loading="lazy" src="${p ? esc(p.thumb) : ''}" alt=""><span class="t"><div class="n">${esc(p ? p.name : h.name)}</div><div class="h">${d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} · ${h.src === 'photo' ? 'photo' : 'camera'}${h.tier === 'confirmed' ? ' · confirmed by you' : ''} · ${h.score.toFixed(2)}</div></span>`;
+    b.onclick = () => (p ? openPerson(p) : toast(`${h.name} is no longer in your list.`));
+    frag.append(b);
+  });
+  list.append(frag);
+  if (!rows.length) list.innerHTML = `<p class="sub">${app.hist.length ? 'No one by that name.' : 'Nobody yet. People you recognise with the camera or in photos show up here.'}</p>`;
+  $('#btn-clear-hist').hidden = !app.hist.length;
+}
+$('#hist-search').addEventListener('input', renderHistory);
+armButton($('#btn-clear-hist'), 'Tap again to clear history', async () => { await DB.histClear().catch(() => {}); app.hist = []; app.lastLog.clear(); renderHistory(); toast('History cleared'); });
+function setPeopleTab(tab) {
+  app.pTab = tab;
+  $('#tab-people').classList.toggle('on', tab === 'people'); $('#tab-history').classList.toggle('on', tab === 'history');
+  $('#pane-people').hidden = tab !== 'people'; $('#pane-history').hidden = tab !== 'history';
+  if (tab === 'history') renderHistory(); else { renderPeopleList(); computeLookalikes(); }
+}
+$('#tab-people').onclick = () => setPeopleTab('people');
+$('#tab-history').onclick = () => setPeopleTab('history');
+$('#btn-people').onclick = () => { setPeopleTab(app.pTab); openSheet('#sheet-people'); };
+
+/* import and export */
 $('#btn-import').onclick = () => $('#file-pack').click();
+async function importPack(text) {
+  const pack = JSON.parse(text);
+  if (pack.format !== 'face-pack' || !Array.isArray(pack.people)) throw new Error('This file is not an RTPI face pack.');
+  const have = new Map(app.people.map((p) => [p.id, p]));
+  const embs = (src, name) => { const o = {}; for (const k of ['emb', 'emb_r50']) if (src[k]) { const v = b64ToF32(src[k]); if (v.length !== DIM) throw new Error(`Bad face data for ${name}.`); o[k] = v; } return o; };
+  const rows = pack.people.map((p) => {
+    const id = String(p.id), old = have.get(id) || {};
+    const row = { ...old, id, source: old.source || p.source || 'pack' };
+    // details changed on this phone win over the pack
+    if (!old.edited) for (const k of ['name', 'headline', 'organisation', 'location', 'link']) row[k] = p[k] || '';
+    const main = { thumb: p.thumb || '', ...embs(p, p.name) };
+    if (!old.keepPhoto) {
+      if (old.thumb && old.thumb !== main.thumb) for (const k of ['emb', 'emb_r50']) if (!main[k]) delete row[k];   // photo changed: stale fingerprint
+      Object.assign(row, main);
+      if (p.face_px) row.face_px = p.face_px; else delete row.face_px;
+    }
+    for (const k of ['tags', 'notes', 'edited', 'keepPhoto']) if (p[k] != null && old[k] == null) row[k] = p[k];
+    // extra photos: ones from the computer (pc:) are replaced by the pack's, ones added on this phone are kept
+    const ex = new Map((old.extra || []).map((x) => [x.id, x]));
+    if (Array.isArray(p.extra)) {
+      for (const idx of [...ex.keys()]) if (String(idx).startsWith('pc:') && idx !== 'pc:main') ex.delete(idx);
+      p.extra.forEach((x) => { const xid = String(x.id || 'pc:' + Math.random().toString(36).slice(2)); ex.set(xid, { id: xid, thumb: x.thumb || '', added: x.added || '', ...embs(x, p.name) }); });
+    }
+    if (old.keepPhoto && main.thumb !== row.thumb) ex.set('pc:main', { id: 'pc:main', added: '', ...main });   // you chose another main photo: keep the pack's as an extra
+    if (ex.size || old.extra) row.extra = [...ex.values()];
+    return row;
+  });
+  await DB.putMany(rows).catch(() => { app.people = rows; });
+  await reloadPeople();
+  toast(`Imported ${rows.length} people`);
+  backfill();
+}
 $('#file-pack').onchange = async (e) => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-  try {
-    const pack = JSON.parse(await f.text());
-    if (pack.format !== 'face-pack' || !Array.isArray(pack.people)) throw new Error('This file is not an RTPI face pack.');
-    const have = new Map(app.people.map((p) => [p.id, p]));
-    const rows = pack.people.map((p) => {
-      const row = { ...(have.get(String(p.id)) || {}), id: String(p.id), name: p.name, headline: p.headline || '', organisation: p.organisation || '', location: p.location || '', link: p.link || '', thumb: p.thumb || '', source: p.source || 'pack' };
-      for (const k of ['emb', 'emb_r50']) if (p[k]) { const v = b64ToF32(p[k]); if (v.length !== DIM) throw new Error(`Bad face data for ${p.name}.`); row[k] = v; }
-      if (Array.isArray(p.extra)) {
-        // photos from the computer replace earlier ones from the computer; photos added on this phone are kept
-        const mine = (row.extra || []).filter((x) => !String(x.id).startsWith('pc:'));
-        const theirs = p.extra.map((x) => { const y = { id: String(x.id || 'pc:' + Math.random().toString(36).slice(2)), thumb: x.thumb || '', added: x.added || '' };
-          for (const k of ['emb', 'emb_r50']) if (x[k]) { const v = b64ToF32(x[k]); if (v.length === DIM) y[k] = v; } return y; });
-        const ids = new Set(theirs.map((x) => x.id));
-        row.extra = [...mine.filter((x) => !ids.has(x.id)), ...theirs];
-      }
-      return row;
-    });
-    await DB.putMany(rows).catch(() => { app.people = rows; });
-    await reloadPeople();
-    toast(`Imported ${rows.length} people`);
-    backfill();
-  } catch (err) { toast(err.message || 'Could not read that file', 4000); }
+  try { await importPack(await f.text()); } catch (err) { toast(err.message || 'Could not read that file', 4000); }
 };
 $('#btn-export').onclick = () => {
   const enc = (v) => v ? f32ToB64(v instanceof Float32Array ? v : new Float32Array(v)) : undefined;
-  const pack = { format: 'face-pack', version: 2, models: ['w600k_mbf', 'w600k_r50'], dim: DIM, created: new Date().toISOString().slice(0, 16).replace('T', ' '),
-    people: app.people.map((p) => ({ id: p.id, name: p.name, headline: p.headline, organisation: p.organisation, location: p.location, link: p.link, thumb: p.thumb, source: p.source, emb: enc(p.emb), emb_r50: enc(p.emb_r50),
+  const pack = { format: 'face-pack', version: 3, models: ['w600k_mbf', 'w600k_r50'], dim: DIM, created: new Date().toISOString().slice(0, 16).replace('T', ' '),
+    people: app.people.map((p) => ({ id: p.id, name: p.name, headline: p.headline, organisation: p.organisation, location: p.location, link: p.link, thumb: p.thumb, source: p.source,
+      tags: p.tags, notes: p.notes, edited: p.edited, keepPhoto: p.keepPhoto, face_px: p.face_px, emb: enc(p.emb), emb_r50: enc(p.emb_r50),
       extra: (p.extra || []).map((x) => ({ id: x.id, thumb: x.thumb, added: x.added, emb: enc(x.emb), emb_r50: enc(x.emb_r50) })) })) };
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(pack)], { type: 'application/json' }));
   a.download = `face_pack_${pack.people.length}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
@@ -688,7 +1001,10 @@ function renderAddSuggest() {
     b.innerHTML = `<img src="${esc(p.thumb)}" alt=""><span class="t"><div class="n">${esc(p.name)}</div><div class="h">${s != null ? `looks ${s.toFixed(2)} similar · ` : ''}${esc(p.headline || p.organisation || '')}</div></span>`;
     b.onclick = async () => {
       if (!app.addDraft) { toast('Capture a face or pick a photo first.'); return; }
-      await addExtra(p, app.addDraft); app.addDraft = null; closeSheet();
+      // the app said Unknown but they were in the list: a missed match, useful for calibration
+      const d = app.addDraft, hit = d.key === embKey() ? matchTop(d.emb, 50).find((t) => t.p === p) : null;
+      if (hit) recordFb(hit.s, true);
+      await addExtra(p, d); app.addDraft = null; closeSheet();
     };
     box.append(b);
   });
@@ -738,6 +1054,7 @@ $('#add-form').onsubmit = async (e) => {
   if (!app.addDraft) { toast('Capture a face or pick a photo first.'); return; }
   const name = $('#add-name').value.trim(); if (!name) return;
   const dup = app.people.length ? match(app.addDraft.emb) : null;
+  if (dup && dup.closest && app.addDraft.key === embKey()) recordFb(dup.score, false);   // a new person: their closest match was not them
   const p = { id: 'u' + Date.now().toString(36), name, headline: $('#add-headline').value.trim(), organisation: $('#add-org').value.trim(),
     location: $('#add-location').value.trim(), link: $('#add-link').value.trim(), thumb: app.addDraft.thumb, source: 'added' };
   p[app.addDraft.key || embKey()] = app.addDraft.emb;
@@ -774,24 +1091,26 @@ async function checkPhoto(blob) {
   let embs = [];
   try { embs = faces.length ? await embedMany(c, faces) : []; } catch (e) { $('#photo-sub').textContent = 'Recognition failed: ' + e.message; return; }
   // each person can only appear once: strongest match claims them
-  const res = faces.map((f, i) => ({ f, e: embs[i], key, top: matchTop(embs[i], 3), person: null, crop: cropData(c, f.box) }));
+  const res = faces.map((f, i) => ({ f, e: embs[i], key, top: matchTop(embs[i], 3), person: null, maybe: null, crop: cropData(c, f.box) }));
   const taken = new Set();
   [...res].sort((a, b) => (b.top[0]?.s || 0) - (a.top[0]?.s || 0)).forEach((r) => {
-    const [a, b] = r.top;
-    if (a && a.s >= thr() && a.s - Math.max(b?.s || 0, 0) >= app.settings.margin && !taken.has(a.p.id)) { r.person = a.p; r.score = a.s; taken.add(a.p.id); }
+    const m = classify(r.top); r.score = m.score;
+    if (m.person && !taken.has(m.person.id)) { r.person = m.person; taken.add(m.person.id); logSeen(m.person, m.score, 'photo', 'known'); }
+    else if ((m.maybe || m.person) && !taken.has((m.maybe || m.person).id)) r.maybe = m.maybe || m.person;
   });
   app.photo = { c, W, H, res };
   renderPhoto();
 }
 
 function renderPhoto() {
+  if (!app.photo) return;
   const { c, W, H, res } = app.photo;
   const known = getComputedStyle(document.documentElement).getPropertyValue('--known').trim();
   const grey = getComputedStyle(document.documentElement).getPropertyValue('--unknown').trim();
-  const named = res.filter((r) => r.person).length;
+  const named = res.filter((r) => r.person).length, poss = res.filter((r) => !r.person && r.maybe).length;
   $('#photo-sub').textContent = !res.length ? 'No faces found. Try a clearer photo where faces are larger.'
     : !app.people.length ? `${res.length} face${res.length > 1 ? 's' : ''} found. Import your face pack to name them.`
-    : `${res.length} face${res.length > 1 ? 's' : ''} found · ${named} recognised`;
+    : `${res.length} face${res.length > 1 ? 's' : ''} found · ${named} recognised${poss ? ` · ${poss} possible` : ''}`;
   // annotated image
   const wrap = $('#photo-wrap'); wrap.hidden = false;
   const cssW = wrap.clientWidth || 360, dpr = Math.min(devicePixelRatio || 1, 2), sc = (cssW * dpr) / W;
@@ -799,23 +1118,24 @@ function renderPhoto() {
   const g = pc.getContext('2d'); g.drawImage(c, 0, 0, pc.width, pc.height);
   const R = Math.max(10, 11 * dpr);
   res.forEach((r, i) => {
-    const [x1, y1, x2, y2] = r.f.box.map((v) => v * sc), col = r.person ? known : grey;
-    g.lineWidth = Math.max(2, 2 * dpr); g.strokeStyle = col; g.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    const [x1, y1, x2, y2] = r.f.box.map((v) => v * sc), col = r.person || r.maybe ? known : grey;
+    g.lineWidth = Math.max(2, 2 * dpr); g.strokeStyle = col; g.setLineDash(!r.person && r.maybe ? [4 * dpr, 4 * dpr] : []); g.strokeRect(x1, y1, x2 - x1, y2 - y1); g.setLineDash([]);
     const cx = Math.min(pc.width - R, Math.max(R, x1)), cy = Math.max(R, y1);
-    g.fillStyle = col; g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.fill();
+    g.fillStyle = r.person ? known : grey; g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.fill();
     g.fillStyle = r.person ? '#1d1505' : '#0e1116'; g.font = `700 ${Math.round(R * 1.1)}px ui-monospace, monospace`;
     g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(String(i + 1), cx, cy + 1);
   });
   // result rows
   const list = $('#photo-results'); list.innerHTML = '';
   res.forEach((r, i) => {
-    const b = document.createElement('button'); b.className = 'res' + (r.person ? ' known' : '');
+    const who = r.person || r.maybe;
+    const b = document.createElement('button'); b.className = 'res' + (r.person ? ' known' : r.maybe ? ' maybe' : '');
     const small = r.f.box[2] - r.f.box[0] < 40;
-    const others = r.top.filter((t) => t.p !== r.person).slice(0, 2).map((t) => `${esc(t.p.name)} ${t.s.toFixed(2)}`).join(' · ');
+    const others = r.top.filter((t) => t.p !== who).slice(0, 2).map((t) => `${esc(t.p.name)} ${t.s.toFixed(2)}`).join(' · ');
     let n, h, alt = '', sc2 = '';
-    if (r.person) {
-      n = esc(r.person.name); h = esc(r.person.headline || r.person.organisation || ''); sc2 = r.score.toFixed(2);
-      if (others) alt = `Next closest: ${others}`;
+    if (who) {
+      n = (r.person ? '' : 'Possibly ') + esc(who.name); h = esc(who.headline || who.organisation || ''); sc2 = r.score.toFixed(2);
+      alt = r.person ? (others ? `Next closest: ${others}` : '') : 'Tap to confirm or reject';
     } else if (!app.people.length) { n = 'Face'; h = 'Import your face pack to name people'; }
     else {
       n = 'Unknown'; const t = r.top[0];
@@ -825,7 +1145,8 @@ function renderPhoto() {
     }
     if (r.person && small) alt = 'Face is small in this photo, so double-check';
     b.innerHTML = `<span class="num">${i + 1}</span><img src="${r.crop}" alt=""><span class="t"><span class="n">${n}</span>${h ? `<span class="h">${h}</span>` : ''}${alt ? `<span class="alt">${alt}</span>` : ''}</span><span class="sc">${sc2}</span>`;
-    b.onclick = () => r.person ? openPerson(r.person, r.score, true, { thumb: r.crop, emb: Float32Array.from(r.e), key: r.key }) : openAdd({ thumb: r.crop, emb: Float32Array.from(r.e), key: r.key });
+    const face = () => ({ thumb: r.crop, emb: Float32Array.from(r.e), key: r.key });
+    b.onclick = () => (who ? openPerson(who, { score: r.score, fromPhoto: true, face: face(), tier: r.person ? 'known' : 'maybe', row: r }) : openAdd(face()));
     list.append(b);
   });
   $('#btn-pick-photo').textContent = res.length ? 'Check another photo' : 'Choose photo';
@@ -835,45 +1156,73 @@ $('#btn-photo').onclick = () => { if (!app.photo) { $('#photo-sub').textContent 
 $('#btn-pick-photo').onclick = () => $('#file-check').click();
 $('#file-check').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) checkPhoto(f); };
 
-// photos shared to RTPI from other apps (Android share menu, installed app only)
-async function takeSharedPhoto() {
+// a photo or a face pack shared to RTPI from another app (Android share menu, installed app only)
+async function takeShared() {
   if (!new URLSearchParams(location.search).has('shared')) return;
   history.replaceState(null, '', location.pathname);
   try {
-    const cache = await caches.open('rtpi-share'); const hit = await cache.match('shared-image');
+    const cache = await caches.open('rtpi-share');
+    const pack = await cache.match('shared-pack');
+    if (pack) {
+      await cache.delete('shared-pack');
+      try { await importPack(await pack.text()); } catch (err) { toast(err.message || 'Could not read that file', 4000); }
+      return;
+    }
+    const hit = await cache.match('shared-image');
     if (hit) { await cache.delete('shared-image'); await checkPhoto(await hit.blob()); }
-  } catch (e) { console.error(e); toast("Couldn't open the shared photo."); }
+  } catch (e) { console.error(e); toast("Couldn't open the shared file."); }
 }
 
-/* fill in fingerprints for the active model from each person's saved face picture
-   (for people added on this phone, or packs made before both models existed) */
-async function backfill() {
-  if (app.backfillRunning || !app.rec) return;
-  const key = embKey(), model = app.recModel;
+/* Fingerprints are prepared in the background for BOTH models, whichever one is in use:
+   first the active model, then the other one (only if its files are already on this phone).
+   Sources are each person's saved face pictures, so this covers people added on the phone and older packs. */
+function missingFor(key) {
   const todo = [];
   for (const p of app.people) {
-    if (!okEmb(p[key]) && p.thumb) todo.push({ p, obj: p });
-    for (const x of p.extra || []) if (!okEmb(x[key]) && x.thumb) todo.push({ p, obj: x });
+    if (!okEmb(p[key]) && p.thumb && !app.bfFailed.has(p)) todo.push({ p, obj: p });
+    for (const x of p.extra || []) if (!okEmb(x[key]) && x.thumb && !app.bfFailed.has(x)) todo.push({ p, obj: x });
   }
-  if (!todo.length) return;
-  app.backfillRunning = true; app.backfill = { done: 0, total: todo.length };
+  return todo;
+}
+async function modelCached(model) {
+  try { const c = await caches.open(ASSET_CACHE); for (const a of MODELS[model].parts) if (!(await c.match(a.url))) return false; return true; } catch { return false; }
+}
+async function fillModel(model, rec, gen, active) {
+  const key = MODELS[model].key, todo = missingFor(key); if (!todo.length) return;
+  app.backfill = { model, done: 0, total: todo.length }; showPrep(); let fresh = 0;
   for (const { p, obj } of todo) {
-    if (app.recModel !== model) break;
+    if (gen !== app.bfGen) return;
     try {
       const img = new Image(); img.src = obj.thumb; await img.decode();
       const c = canvas(img.naturalWidth, img.naturalHeight); c.getContext('2d').drawImage(img, 0, 0);
       const faces = await detect(c, c.width, c.height, 320, 0.4);
       if (faces.length) {
-        const f0 = faces.sort((a, b) => (b.box[2] - b.box[0]) - (a.box[2] - a.box[0]))[0];
-        while (app.rec.pending > 0) await sleep(30); // let the live camera go first
-        const [e] = await embedMany(c, [f0]);
-        obj[key] = e; await DB.putMany([p]).catch(() => {});
-      }
-    } catch (e) { console.warn('backfill', p.name, e); }
-    app.backfill.done++; setStatus();
+        while (rec.pending > 0) await sleep(30);   // the live camera goes first
+        if (gen !== app.bfGen) return;
+        const [e] = await rec.embed(alignedBatch(c, [largest(faces)]), 1);
+        obj[key] = e; await DB.putMany([p]).catch(() => {}); fresh++;
+      } else app.bfFailed.add(obj);
+    } catch (e) { if (/closed/.test(e.message)) return; app.bfFailed.add(obj); console.warn('prepare', p.name, e); }
+    app.backfill.done++; showPrep();
+    if (active && fresh >= 25) { fresh = 0; rebuildIndex(false); setStatus(); }   // people become recognisable as they are prepared
   }
-  app.backfillRunning = false; app.backfill = null;
-  rebuildIndex(); setStatus();
+  if (active && gen === app.bfGen) { rebuildIndex(false); setStatus(); }
+}
+async function backfill() {
+  const gen = ++app.bfGen; if (!app.rec) return;
+  while (app.bfBusy) await sleep(50);   // an earlier run stops at its next step
+  if (gen !== app.bfGen) return;
+  app.bfBusy = true;
+  try {
+    await fillModel(app.recModel, app.rec, gen, true);
+    const other = app.recModel === 'accurate' ? 'fast' : 'accurate';
+    if (gen === app.bfGen && missingFor(MODELS[other].key).length && await modelCached(other)) {
+      const rec = await makeRecognizer(joinBuffers(await Promise.all(MODELS[other].parts.map((a) => getAsset(a, () => {})))));
+      try { await fillModel(other, rec, gen, false); } finally { rec.close(); }
+    }
+  } catch (e) { console.warn('prepare', e); }
+  app.bfBusy = false;
+  if (gen === app.bfGen) { app.backfill = null; showPrep(); if (openSheetEl === $('#sheet-people') && app.pTab === 'people') renderPeopleList(); }
 }
 
 /* settings */
@@ -885,18 +1234,23 @@ function syncSettings() {
     ? 'Best with turned heads and lookalikes. Names appear about a second after a face shows up.'
     : 'Names appear instantly, but turned heads and lookalikes are more often missed or confused.';
   $('#s-max').closest('label').hidden = (app.recModel || s.model) !== 'fast';
-  save('rtpi-settings', s);
+  save('rtpi-settings', s); renderCalib();
 }
 function bindSettings() {
   const s = app.settings;
   const sync = syncSettings;
   $('#s-margin').value = s.margin; $('#s-det').value = s.det; $('#s-max').value = s.max; $('#s-scores').checked = s.scores;
+  $('#s-maybe').checked = s.maybe; $('#s-learn').checked = s.learn;
   $('#s-model').onchange = (e) => switchModel(e.target.value);
   $('#s-thr').oninput = (e) => { s['thr_' + (app.recModel || s.model)] = +e.target.value; sync(); };
   $('#s-margin').oninput = (e) => { s.margin = +e.target.value; sync(); };
   $('#s-det').onchange = (e) => { s.det = +e.target.value; sync(); };
   $('#s-max').onchange = (e) => { s.max = +e.target.value; sync(); };
   $('#s-scores').onchange = (e) => { s.scores = e.target.checked; sync(); };
+  $('#s-maybe').onchange = (e) => { s.maybe = e.target.checked; sync(); app.tracks.forEach((t) => { if (t.emb) t.result = match(t.emb, t.deny); }); };
+  $('#s-learn').onchange = (e) => { s.learn = e.target.checked; sync(); };
+  $('#calib-apply').onclick = () => { const c = calib(app.recModel || s.model); if (c.thr == null) return; s['thr_' + (app.recModel || s.model)] = c.thr; sync(); toast(`Threshold set to ${c.thr.toFixed(2)}`); };
+  armButton($('#calib-reset'), 'Tap again to forget the answers', () => { app.fb[app.recModel || s.model] = []; save('rtpi-fb', app.fb); renderCalib(); });
   sync();
 }
 $('#btn-settings').onclick = () => openSheet('#sheet-settings');
@@ -911,12 +1265,16 @@ document.addEventListener('visibilitychange', async () => {
   sizeOverlay(); bindSettings();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname))) navigator.serviceWorker.register('sw.js').catch(() => {});
   try { await DB.open(); } catch (e) { console.warn('IndexedDB unavailable; people will not be kept between visits', e); }
+  try {
+    app.hist = ((await DB.histAll()) || []).sort((a, b) => a.t - b.t);
+    if (app.hist.length > 5000) { const old = app.hist.splice(0, app.hist.length - 5000); DB.histDel(old.map((h) => h.id)).catch(() => {}); }
+  } catch { app.hist = []; }
   showNotice('Loading face models', `About ${app.settings.model === 'accurate' ? 57 : 27} MB, downloaded once and then kept on this phone.`, [], true);
   try { await loadModels(); }
   catch (e) { console.error(e); app.loadError = true; showNotice("Couldn't load the face models", e.message || String(e), [{ label: 'Reload', primary: true, fn: () => location.reload() }]); return; }
   await reloadPeople();
   window.__rtpi = app;
-  if (new URLSearchParams(location.search).has('shared')) { hideNotice(); await takeSharedPhoto(); }
+  if (new URLSearchParams(location.search).has('shared')) { hideNotice(); await takeShared(); }
   showNotice('Starting camera', 'Allow camera access when your browser asks.');
   if (await startCamera()) { updateNotice(); started = true; loop(); }
   syncSettings(); backfill();
