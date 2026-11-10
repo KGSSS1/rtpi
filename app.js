@@ -4,7 +4,7 @@
    -> cosine match against the local people list. */
 'use strict';
 
-const APP_V = '7';
+const APP_V = '8';
 // Never sit silently on the loading screen: show any startup error.
 let started = false; // once the camera loop runs, errors are logged instead of taking over the screen
 function fatal(msg) {
@@ -37,7 +37,7 @@ if (document.documentElement.dataset.v !== APP_V) {
 const $ = (s) => document.querySelector(s);
 const ARC = [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]];
 const DIM = 512;
-const DEFAULTS = { model: 'accurate', thr_accurate: 0.40, thr_fast: 0.42, margin: 0.05, det: 384, max: 3, scores: false, facing: 'user', maybe: true, learn: false, scope: '' };
+const DEFAULTS = { model: 'accurate', thr_accurate: 0.40, thr_fast: 0.42, margin: 0.05, det: 384, max: 3, scores: false, facing: 'user', maybe: true, learn: false, scope: '', focus: true };
 const MAYBE_BAND = 0.05;   // how far below the threshold a match is still shown as "Possibly …"
 const SHARP_MIN = 12;      // below this the aligned face is too blurred to trust (variance of Laplacian)
 const SHARP_GOOD = 40;     // sharp enough to keep as a learned photo
@@ -435,12 +435,54 @@ async function startCamera() {
     return false;
   }
   video.srcObject = app.stream;
+  await setupFocus();
   video.classList.toggle('mirror', facing === 'user');
   await video.play().catch(() => {});
   app.tracks = [];
   try { app.wake = await navigator.wakeLock?.request('screen'); } catch { /* optional */ }
   return true;
 }
+/* ---------- focus: continuous autofocus, aimed at the face being recognised ----------
+   Uses whatever the camera exposes to the browser. Fixed-focus cameras (most front cameras) report no focus modes. */
+async function setupFocus() {
+  const tr = app.stream.getVideoTracks()[0];
+  const f = app.focus = { track: tr, mode: 'none', aim: false, at: 0, pt: null, lost: 0 };
+  let caps = {}; try { caps = tr.getCapabilities ? tr.getCapabilities() : {}; } catch { /* not supported */ }
+  const modes = caps.focusMode || [], adv = {};
+  if (modes.includes('continuous')) { f.mode = 'continuous'; adv.focusMode = 'continuous'; }
+  else if (modes.includes('single-shot')) f.mode = 'single-shot';
+  else if (modes.length) f.mode = 'fixed';
+  if ((caps.exposureMode || []).includes('continuous')) { adv.exposureMode = 'continuous'; f.expo = true; }
+  if ((caps.whiteBalanceMode || []).includes('continuous')) adv.whiteBalanceMode = 'continuous';
+  if (Object.keys(adv).length) { try { await tr.applyConstraints({ advanced: [adv] }); } catch (e) { console.warn('focus setup', e); } }
+  f.aim = f.mode === 'continuous' || f.mode === 'single-shot' || !!f.expo;
+  focusNote();
+}
+function focusNote() {
+  const el = $('#focus-note'), f = app.focus; if (!el) return;
+  el.textContent = !f ? '' : f.mode === 'continuous' ? `This camera refocuses continuously${f.aim && f.aimOk !== false ? ', and focus and brightness follow the face' : ''}.`
+    : f.mode === 'single-shot' ? 'This camera refocuses on the face each time it moves.'
+    : f.expo ? 'This camera has fixed focus, so it cannot refocus. Brightness still follows the face.'
+    : 'This camera has fixed focus or does not let the browser control it. Try the back camera.';
+}
+// point focus and exposure at the largest face; re-aim when it moves, drifts out of focus, or every few seconds
+function aimFocus() {
+  const f = app.focus; if (!f || !f.aim || f.aimOk === false || !app.settings.focus) return;
+  const now = performance.now(); if (now - f.at < 1200) return;
+  const t = app.tracks.filter((t) => !t.missed).sort((a, b) => (b.box[2] - b.box[0]) - (a.box[2] - a.box[0]))[0];
+  let pt;
+  if (t) { pt = { x: (t.box[0] + t.box[2]) / 2 / app.frameW, y: (t.box[1] + t.box[3]) / 2 / app.frameH }; f.lost = 0; }
+  else { if (!f.pt || ++f.lost < 30) return; pt = null; }   // no face for a while: back to the centre
+  const moved = !f.pt || !pt || Math.hypot(pt.x - f.pt.x, pt.y - f.pt.y) > 0.08;
+  const soft = t && t.sharp != null && t.sharp < 25 && now - f.at > 2500;
+  if (!moved && !soft && now - f.at < 5000) return;
+  f.at = now; f.pt = pt;
+  const p = pt || { x: 0.5, y: 0.5 }, adv = { pointsOfInterest: [{ x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) }] };
+  if (f.mode === 'continuous' || f.mode === 'single-shot') adv.focusMode = f.mode;
+  if (f.expo) adv.exposureMode = 'continuous';
+  f.track.applyConstraints({ advanced: [adv] }).then(() => { f.aimOk = true; }).catch(() => { f.aimOk = false; focusNote(); });
+}
+
 function stopCamera() { if (app.stream) app.stream.getTracks().forEach((t) => t.stop()); app.stream = null; }
 
 /* ---------- main loop ---------- */
@@ -462,6 +504,7 @@ async function loop() {
       faces.sort((a, b) => (b.box[2] - b.box[0]) - (a.box[2] - a.box[0]));
       associate(faces.slice(0, 8));
       scheduleRecognition();
+      aimFocus();
     } catch (e) { console.error(e); }
     draw();
     const now = performance.now(); app.fps = app.fps * 0.8 + (1000 / Math.max(1, now - lastT)) * 0.2; lastT = now;
@@ -1240,7 +1283,8 @@ function bindSettings() {
   const s = app.settings;
   const sync = syncSettings;
   $('#s-margin').value = s.margin; $('#s-det').value = s.det; $('#s-max').value = s.max; $('#s-scores').checked = s.scores;
-  $('#s-maybe').checked = s.maybe; $('#s-learn').checked = s.learn;
+  $('#s-maybe').checked = s.maybe; $('#s-learn').checked = s.learn; $('#s-focus').checked = s.focus;
+  $('#s-focus').onchange = (e) => { s.focus = e.target.checked; sync(); };
   $('#s-model').onchange = (e) => switchModel(e.target.value);
   $('#s-thr').oninput = (e) => { s['thr_' + (app.recModel || s.model)] = +e.target.value; sync(); };
   $('#s-margin').oninput = (e) => { s.margin = +e.target.value; sync(); };

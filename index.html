@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-v="7">
+<html lang="en" data-v="8">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -364,19 +364,23 @@ textarea { width: 100%; background: var(--panel-2); border: 1px solid var(--line
         <button type="button" class="btn" id="calib-reset" hidden>Forget answers</button>
       </div>
     </div>
+    <div class="setting">
+      <label class="toggle"><span>Keep focus on faces</span><input type="checkbox" id="s-focus"></label>
+      <small id="focus-note"></small>
+    </div>
     <label class="toggle"><span>Show match scores on screen</span><input type="checkbox" id="s-scores"></label>
     <label class="toggle"><span>Show "Possibly" for near matches</span><input type="checkbox" id="s-maybe"></label>
     <div class="setting">
       <label class="toggle"><span>Learn from very confident matches</span><input type="checkbox" id="s-learn"></label>
       <small>Saves a person's current look as an extra photo when the match is very strong. Up to 5 each; you can remove them on their card.</small>
     </div>
-    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded. · v7</p>
+    <p class="privacy">Face detection and matching run entirely on this phone. Camera frames and your people list are never uploaded. · v8</p>
   </div>
 </section>
 
 <div id="toast" hidden></div>
 
 <script src="vendor/ort.wasm.min.js"></script>
-<script src="app.js?v=7"></script>
+<script src="app.js?v=8"></script>
 </body>
 </html>
